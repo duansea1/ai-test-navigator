@@ -26,6 +26,7 @@ reports/
 *.log
 *.err
 scripts/.dsh-closure.json
+scripts/last_task.json
 
 # ── 系统文件 ───────────────────────────────────────────────
 .DS_Store
