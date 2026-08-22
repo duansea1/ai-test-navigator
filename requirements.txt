@@ -1,0 +1,11 @@
+pydantic>=2.7,<3
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+jinja2>=3.1,<4
+httpx2>=0.1
+SQLAlchemy>=2.0,<3
+alembic>=1.13,<2
+PyMySQL>=1.1,<2
+python-dotenv>=1.0,<2
+# Optional: install deepseek-harness-sdk separately in Linux/macOS/WSL2.
+# Windows native uses deterministic fallback by default because the runtime wheel is unavailable.

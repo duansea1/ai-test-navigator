@@ -1,0 +1,191 @@
+# AI Test Navigator · DSH Runtime 满血组合
+#
+# 这是平台的 DSH Runtime 编排配置（cordis 插件组合），替代 SDK 内置的最小
+# jsonrpc-agent 组合。设计参考：
+#   - examples/jsonrpc-agent/cordis.yml（SDK JSON-RPC 场景基线）
+#   - examples/acp-agent/cordis.yml（subagent/workflow/sandbox 满血组合）
+#   - apps/cli/config/agent-presets/standard/agent.cordis.yml（官方标准预设）
+#
+# 相比 SDK 内置组合，本组合额外启用：
+#   1. 原生子代理：subagent / subagent_fork（in-process spawn/fork 双通道）
+#   2. Claude Code 子代理：subagent_claude_code（官方 Agent SDK，claude CLI 在 PATH）
+#   3. 工作流引擎：workflow（worker-thread）+ ralph（自主循环）
+#   4. Skills：项目 skills/ 目录（DSH_CUSTOM_SKILL_DIRS 环境变量注入）
+#   5. 文件系统全套：fs 读写 + fs-search（glob/grep）
+#   6. todo / jobs / ask_user 等生产力工具
+#   7. 长会话支撑：token-meter + compaction + tool-result-pruner
+#
+# 维护约定：DSH 上游 git pull 后无需改动本文件（插件名向后兼容）；
+# 新能力按需追加行即可，改动会经 scripts/smoke-dsh.py 冒烟验证。
+
+# ── JSON-RPC 服务与模型路由 ─────────────────────────────────────────────────
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    thinking: enabled
+    reasoningEffort: max
+
+# ── 本地执行与文件系统 ──────────────────────────────────────────────────────
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 60000
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── Agent 脊柱：persona / 工作区上下文 / Skills ────────────────────────────
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: |-
+      你是 AI Test Navigator（FDE 质量分析平台）的分析引擎，运行在 {{model}} 模型上。
+      工作目录：{{cwd}}。你以证据优先的方式工作：每个判断都绑定文件、行号、符号或
+      命令输出；证据不足时显式声明，而不是猜测。复杂任务善用子代理与工作流并行推进。
+    workspaceContext:
+      maxBytes: 65536
+    skills:
+      enabled: true
+      filesystem:
+        # 平台 skills/ 目录经 DSH_CUSTOM_SKILL_DIRS（分号分隔）注入，
+        # 与项目根 .dsh/skills、用户 ~/.dsh/skills 一并扫描。
+        # 写法注意：不使用 `[]` 字面量（cordis YAML 解析限制），空值由 filter(Boolean) 消化。
+        customSkillDirs: !!js (process.env.DSH_CUSTOM_SKILL_DIRS ?? '').split(';').filter(Boolean)
+    toolBash:
+      enableRunInBackground: false
+
+# ── 会话持久化 ──────────────────────────────────────────────────────────────
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+# ── 子代理（spawn / fork / claude-code）─────────────────────────────────────
+
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-spawn-in-process
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  config:
+    providerName: spawn
+
+- id: subagent-fork-in-process
+  name: '@deepseek-ai/dsh-subagent-fork-in-process'
+  config:
+    providerName: fork
+
+# Claude Code provider 注册（官方 cordis.patch.yml 同款）：注册后
+# tool-subagent-claude-code 才能解析 provider: claude-code
+- id: subagent-claude-code
+  name: '@deepseek-ai/dsh-subagent-claude-code'
+
+# 会话投影：list_agents / 子代理列表等目录能力依赖它
+- id: session-projection
+  name: '@deepseek-ai/dsh-session-projection'
+
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+
+- id: tool-subagent-list-agents
+  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+- id: tool-subagent-report
+  name: '@deepseek-ai/dsh-tool-subagent-report'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+    maxDepth: 1
+
+- id: tool-subagent-fork
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: fork
+    toolName: subagent_fork
+    backgroundMode: continuable
+    maxDepth: 1
+
+# Claude Code 子代理：经官方 Agent SDK 派生 claude CLI 会话（one-shot）。
+# 依赖：机器已安装 claude CLI 且登录有效；载体闭包含 dsh-subagent-claude-code。
+- id: tool-subagent-claude-code
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: claude-code
+    toolName: subagent_claude_code
+    backgroundMode: one-shot
+    maxDepth: provider-managed
+
+# ── 工作流与自主循环 ────────────────────────────────────────────────────────
+
+- id: workflow-worker-thread
+  name: '@deepseek-ai/dsh-workflow-worker-thread'
+  config:
+    provider: spawn
+
+- id: tool-workflow
+  name: '@deepseek-ai/dsh-tool-workflow'
+
+- id: tool-ralph
+  name: '@deepseek-ai/dsh-tool-ralph'
+  config:
+    subagentProvider: spawn
+    maxRounds: 64
+
+# ── 生产力工具 ──────────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# 注：tool-ask-user（依赖 userQuestions 服务）与 command-compact（依赖 commands
+# 服务）是 CLI host 组件，SDK Runtime 场景不提供这两个服务，无法挂载。
+
+# ── 长会话支撑 ──────────────────────────────────────────────────────────────
+
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+
+- id: tool-result-pruner
+  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+  config:
+    thresholdChars: 8192
+    headChars: 4096
+    tailChars: 1024

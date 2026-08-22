@@ -1,0 +1,20 @@
+{
+  "name": "ai-test-navigator-frontend",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ../scripts/build-frontend.mjs",
+    "setup-deps": "node ../scripts/setup-frontend-deps.mjs"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.5.0"
+  }
+}
