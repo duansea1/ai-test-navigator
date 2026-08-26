@@ -1,5 +1,6 @@
 import React from 'react'
 import { getJson } from '../api'
+import { EmptyState } from '../components/ui'
 
 interface ReportItem {
   report_id: string
@@ -21,7 +22,10 @@ export function ReportsPage() {
   return (
     <div className="card">
       <h3>报告列表（{data.reports.length} 份）</h3>
-      {data.reports.length === 0 ? <div className="empty">暂无报告，先到需求分析创建分析任务</div> : (
+      {data.reports.length === 0 ? (
+        <EmptyState icon="file-text" title="暂无报告" desc="先到需求分析创建分析任务，完成后会自动生成 HTML / Markdown / JSON 报告"
+          action="前往需求分析" onAction={() => { location.hash = '/requirements' }} />
+      ) : (
         <table>
           <thead>
             <tr><th>报告 ID</th><th>生成时间</th><th>分支</th><th>项目</th><th>需求</th><th>证据</th><th>用例</th><th>待评审</th><th>导出</th></tr>
@@ -47,7 +51,7 @@ export function ReportsPage() {
           </tbody>
         </table>
       )}
-      <p className="hint" style={{ marginTop: 12 }}>版本对比与人工复核流将在 M2 落地。</p>
+      <p className="hint" style={{ marginTop: 12 }}>needs_review 人工复核流（确认/误报/漏报留痕）排期 M3.2；版本对比为扩展项。</p>
     </div>
   )
 }

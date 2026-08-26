@@ -40,6 +40,7 @@ async def create_task(
     workspace: str = Form(""),
     title: str = Form(""),
     mode: str = Form("auto"),
+    conversation_id: str = Form(""),
 ) -> dict[str, object]:
     s = get_settings()
     projects = projects or ""
@@ -60,22 +61,82 @@ async def create_task(
     source_text = "\n\n".join(sources)
     task_title = title.strip() or (sources[0].strip().splitlines()[0][:80] if sources[0].strip() else "未命名分析任务")
     task_id = orchestrator.create_task(task_title, source_text, projects, branch, workspace, mode=mode)
-    return {"task_id": task_id, "status": "pending", "message": "任务已创建，正在异步执行"}
+    # 多轮会话：任务消息入会话流（user 消息在 /chat 已记；这里补 assistant 任务块）
+    conv_id = conversation_id.strip()
+    if conv_id:
+        try:
+            from app.db import entities as E
+            if E.get_conversation(conv_id):
+                E.save_message(conv_id, "assistant", f"已创建分析任务「{task_title}」，8-Agent 流水线执行中。",
+                               intent=mode if mode != "auto" else "full", task_id=task_id)
+                E.touch_conversation(conv_id)
+        except Exception:  # 会话落库失败不阻塞任务创建
+            pass
+    return {"task_id": task_id, "conversation_id": conv_id or None,
+            "status": "pending", "message": "任务已创建，正在异步执行"}
 
 
 @router.post("/requirements/classify")
-async def classify(text: str = Form("")) -> dict[str, object]:
-    """意图识别：用 DSH 判断输入属于 问答/需求分析/全流程（最优解），失败回退启发式。"""
+async def classify(text: str = Form(""), conversation_id: str = Form("")) -> dict[str, object]:
+    """意图识别：用 DSH 判断输入属于 问答/需求分析/全流程（最优解），失败回退启发式。
+    conversation_id 关联多轮会话（同会话共享 DSH 上下文）。"""
     from app.services.router import classify as do_classify
-    return await asyncio.to_thread(do_classify, text or "")
+    return await asyncio.to_thread(do_classify, text or "", conversation_id or None)
 
 
 @router.post("/chat")
-async def chat(text: str = Form("")) -> dict[str, object]:
-    """问答式对话：直接回答，不进入分析流水线。"""
-    from app.services.router import qa_answer
-    answer = await asyncio.to_thread(qa_answer, text or "")
-    return {"answer": answer}
+async def chat(text: str = Form(""), conversation_id: str = Form(""),
+               mode: str = Form("")) -> dict[str, object]:
+    """对话回合（多轮）：classify（qa 时直接回答）+ 消息落库。
+    analyze/full 由前端转 /requirements/tasks 建任务，这里只处理问答回合。
+    mode 显式指定时跳过 classify（用户手动选的模式）。"""
+    from app.db import entities as E
+    from app.services.router import classify as do_classify, qa_answer
+
+    t = (text or "").strip()
+    conv_id = conversation_id.strip() or None
+
+    def _run() -> dict[str, object]:
+        # 无会话时自动开一个（首次对话）
+        if conv_id is None:
+            cid = E.create_conversation(t[:80] or "新会话")
+        else:
+            cid = conv_id
+            if not E.get_conversation(cid):
+                raise HTTPException(404, f"会话不存在：{cid}")
+        E.save_message(cid, "user", t)
+        if mode and mode != "auto" and mode != "qa":
+            intent = {"intent": mode, "confidence": 1.0, "reason": "用户手动指定模式"}
+        else:
+            intent = do_classify(t, cid)
+        if intent["intent"] == "qa" or mode == "qa":
+            answer = qa_answer(t, cid)
+            E.save_message(cid, "assistant", answer, intent=intent["intent"])
+            E.touch_conversation(cid)
+            return {"conversation_id": cid, "intent": "qa", "reason": intent.get("reason", ""),
+                    "answer": answer, "task_id": None}
+        # analyze/full：记一条意图，任务由 /requirements/tasks 创建后由前端补记
+        E.touch_conversation(cid)
+        return {"conversation_id": cid, "intent": intent["intent"],
+                "reason": intent.get("reason", ""), "answer": None, "task_id": None}
+
+    return await asyncio.to_thread(_run)
+
+
+@router.get("/conversations")
+async def list_conversations(limit: int = 50) -> dict[str, object]:
+    """会话列表（最近活跃在前）。"""
+    from app.db import entities as E
+    return {"conversations": E.list_conversations(limit=limit)}
+
+
+@router.get("/conversations/{conv_id}/messages")
+async def conversation_messages(conv_id: str) -> dict[str, object]:
+    """会话消息流（正序）：user / assistant（含 intent 与关联 task_id）。"""
+    from app.db import entities as E
+    if E.get_conversation(conv_id) is None:
+        raise HTTPException(404, f"会话不存在：{conv_id}")
+    return {"conversation_id": conv_id, "messages": E.list_messages(conv_id)}
 
 
 @router.get("/requirements/tasks")

@@ -7,7 +7,7 @@ def get(url):
     with urllib.request.urlopen(url, timeout=20) as r:
         return json.loads(r.read().decode("utf-8"))
 
-for i in range(20):
+for i in range(40):
     try:
         t = get(f"{BASE}/api/requirements/tasks/{TASK_ID}")
     except Exception as e:

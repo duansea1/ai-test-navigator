@@ -1,6 +1,7 @@
 import React from 'react'
 import { getJson, postForm, postJson, streamSse } from '../api'
 import { ModelModal } from '../components/ModelDrawer'
+import { toast as showToast, Icon } from '../components/ui'
 
 /* ── 类型 ──────────────────────────────────────────────────────────── */
 interface TaskItem {
@@ -8,13 +9,18 @@ interface TaskItem {
   status: string; stage: string; progress: number; message: string | null
   report_id: string | null; error: string | null; created_at: string
 }
+interface ConvItem { conv_id: string; title: string; created_at: string; updated_at: string }
+interface ConvMessage {
+  role: string; content: string; intent?: string | null; task_id?: string | null
+  created_at: string
+}
 interface ActItem {
   seq: number; time: string; agent: string; agent_name: string; kind: string
   tool?: string; detail?: string; text?: string; ok?: boolean; summary?: string
   preview?: string; model?: string; provider?: string; stage?: string; progress?: number
 }
 interface ReqItem { id: string; title: string; description: string; priority: string; acceptance_criteria: string[] }
-interface EvidenceItem { project: string; path: string; line_no: number | null; symbol: string; summary: string; relevance: string }
+interface EvidenceItem { project: string; path: string; line_no: number | null; symbol: string; summary: string; relevance: string; req_ref?: string | null }
 interface ImpactItem { project: string; area: string; risk_level: string; steps: Array<{ project?: string; component?: string; call?: string }> }
 interface TestCaseItem { req_ref: string; case_type: string; title: string; steps: string[]; expected: string }
 interface AssessmentItem { req_ref: string; verdict: string; risk: string; confidence: number | null; evidence_refs: string[]; gaps: string[] }
@@ -25,7 +31,7 @@ interface Analysis {
   views: { dev?: string; qa?: string; product?: string }; agent_sessions: AgentSessionItem[]
 }
 interface ProjectOption { name: string; is_git: boolean; branch: string }
-interface RuntimeStatus { ready: boolean; provider: string; model: string; mode: string; api_key_configured: boolean; provider_key?: string }
+interface RuntimeStatus { ready: boolean; callable?: boolean; provider: string; model: string; mode: string; api_key_configured: boolean; provider_key?: string }
 interface ModelOption { id: string; label: string }
 
 const PRIORITY_CLS: Record<string, string> = { P0: 'bad', P1: 'warn', P2: 'neutral', P3: 'neutral' }
@@ -424,7 +430,10 @@ export function RequirementsPage() {
   const [models, setModels] = React.useState<ModelOption[]>([])
   const [drawerOpen, setDrawerOpen] = React.useState(false)
   const [history, setHistory] = React.useState<TaskItem[]>([])
-  // 当前任务
+  const [convs, setConvs] = React.useState<ConvItem[]>([])
+  // 当前会话与任务
+  const [convId, setConvId] = React.useState('')
+  const [messages, setMessages] = React.useState<ConvMessage[]>([])  // 会话消息流（多轮）
   const [activeId, setActiveId] = React.useState('')
   const [task, setTask] = React.useState<TaskItem | null>(null)
   const [acts, setActs] = React.useState<ActItem[]>([])
@@ -439,10 +448,10 @@ export function RequirementsPage() {
   const [advOpen, setAdvOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
   const [formErr, setFormErr] = React.useState('')
-  const [toast, setToast] = React.useState('')
   const [mode, setMode] = React.useState<string>('auto')
   const [qaMsg, setQaMsg] = React.useState<{ q: string; a: string } | null>(null)
   const [detected, setDetected] = React.useState('')
+  const [intentReason, setIntentReason] = React.useState('')
 
   const msgsRef = React.useRef<HTMLDivElement>(null)
   const inputRef = React.useRef<HTMLTextAreaElement>(null)
@@ -450,10 +459,7 @@ export function RequirementsPage() {
   const stickRef = React.useRef(true)
   const doneRef = React.useRef(false)
 
-  const showToast = (msg: string) => {
-    setToast(msg)
-    window.setTimeout(() => setToast(''), 2600)
-  }
+  const showToastMsg = (msg: string) => showToast(msg, 'info')
 
   React.useEffect(() => {
     getJson<{ workspace: string; default_branch: string; projects: ProjectOption[] }>('/api/projects')
@@ -469,12 +475,13 @@ export function RequirementsPage() {
 
   const refreshHistory = React.useCallback(() => {
     getJson<{ tasks: TaskItem[] }>('/api/requirements/tasks?limit=30').then(d => setHistory(d.tasks)).catch(() => {})
+    getJson<{ conversations: ConvItem[] }>('/api/conversations?limit=30').then(d => setConvs(d.conversations)).catch(() => {})
   }, [])
   React.useEffect(() => { refreshHistory() }, [refreshHistory])
 
   React.useEffect(() => {
     if (stickRef.current && msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight
-  }, [acts, analysis])
+  }, [acts, analysis, messages])
 
   function loadAnalysis(id: string) {
     getJson<Analysis>(`/api/requirements/tasks/${id}/analysis`).then(d => {
@@ -540,13 +547,30 @@ export function RequirementsPage() {
 
   /** 新建会话：清空视图 + 聚焦输入框 + 闪烁提示。 */
   function newSession() {
+    setConvId(''); setMessages([])
     setActiveId(''); setTask(null); setActs([]); setAnalysis(null)
     setBusy(false); doneRef.current = false
     setText(''); setFiles([])
+    setQaMsg(null); setDetected(''); setIntentReason('')
     inputRef.current?.focus()
     const el = composerRef.current
     if (el) { el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash') }
-    showToast('已开启新会话，输入需求开始分析')
+    showToastMsg('已开启新会话，输入需求开始分析')
+  }
+
+  /** 打开会话：回放消息流，最新任务块自动展开跟踪。 */
+  function openConversation(id: string) {
+    setConvId(id)
+    setMessages([])
+    setActiveId(''); setTask(null); setActs([]); setAnalysis(null)
+    setBusy(false); doneRef.current = false
+    stickRef.current = true
+    getJson<{ messages: ConvMessage[] }>(`/api/conversations/${id}/messages`).then(d => {
+      setMessages(d.messages ?? [])
+      // 会话内最新任务自动挂载（活动流 + 结果面板）
+      const lastTask = [...(d.messages ?? [])].reverse().find(m => m.task_id)
+      if (lastTask?.task_id) openTask(lastTask.task_id)
+    }).catch(() => {})
   }
 
   /** 切换模型（运行时热切换）。 */
@@ -565,7 +589,7 @@ export function RequirementsPage() {
     const arr = Array.from(list)
     if (arr.length === 0) return
     setFiles(prev => [...prev, ...arr])
-    showToast(`已添加 ${arr.length} 个附件`)
+    showToastMsg(`已添加 ${arr.length} 个附件`)
   }
   function onPaste(e: React.ClipboardEvent) {
     const fs = e.clipboardData?.files
@@ -589,24 +613,27 @@ export function RequirementsPage() {
     }
     setBusy(true)
     try {
-      const doQa = async () => {
-        const fd = new FormData()
-        fd.append('text', text.trim())
-        const d = await postForm<{ answer: string }>('/api/chat', fd)
-        setQaMsg({ q: text.trim(), a: d.answer || '（无回答）' })
+      // 多轮会话主链路：/api/chat 一体做 classify + qa 回答 + 消息落库
+      const cf = new FormData()
+      cf.append('text', text.trim())
+      if (convId) cf.append('conversation_id', convId)
+      if (mode !== 'auto') cf.append('mode', mode)
+      const d = await postForm<{ conversation_id: string; intent: string; reason?: string; answer?: string | null }>('/api/chat', cf)
+      if (d.conversation_id && !convId) setConvId(d.conversation_id)
+      // 本地即时追加 user 消息（后端已落库）
+      setMessages(prev => [...prev, { role: 'user', content: text.trim(), created_at: '' }])
+      setDetected(d.intent)
+      setIntentReason(d.reason || '')
+      if (d.intent === 'qa') {
+        // 问答回合：直接渲染回答（后端已落库），一轮结束但会话继续
+        setMessages(prev => [...prev, { role: 'assistant', content: d.answer || '（无回答）', intent: 'qa', created_at: '' }])
         setText(''); setFiles([])
+        setBusy(false)
+        refreshHistory()
+        return
       }
-      // 问答模式：直接对话，不进分析流水线
-      if (mode === 'qa') { await doQa(); setBusy(false); return }
-      let resolved: string = mode
-      if (mode === 'auto') {
-        const cf = new FormData()
-        cf.append('text', text.trim())
-        const c = await postForm<{ intent: string }>('/api/requirements/classify', cf)
-        if (c.intent === 'qa') { await doQa(); setBusy(false); return }
-        resolved = c.intent || 'full'
-        setDetected(resolved)
-      }
+      // analyze/full：建任务（带会话 ID），任务块进入消息流
+      const resolved: string = d.intent === 'analyze' ? 'analyze' : 'full'
       const fd = new FormData()
       if (text.trim()) fd.append('text', text)
       const docExt = /\.(md|txt|csv|json|xml|ya?ml|log)$/i
@@ -617,8 +644,12 @@ export function RequirementsPage() {
       fd.append('projects', selProjects.join(' '))
       if (workspace.trim()) fd.append('workspace', workspace)
       if (branch.trim()) fd.append('branch', branch)
+      if (d.conversation_id) fd.append('conversation_id', d.conversation_id)
       const created = await postForm<{ task_id: string }>('/api/requirements/tasks', fd)
-      setQaMsg(null); setDetected('')
+      setMessages(prev => [...prev, {
+        role: 'assistant', content: `已创建分析任务，8-Agent 流水线执行中。`,
+        intent: resolved, task_id: created.task_id, created_at: '',
+      }])
       setText('')
       setFiles([])
       refreshHistory()
@@ -656,26 +687,41 @@ export function RequirementsPage() {
 
   return (
     <div className="req-layout">
-      {/* ── 左侧：任务列表 ─────────────────────────────────────────── */}
+      {/* ── 左侧：会话列表（多轮）+ 任务入口 ────────────────────────── */}
       <div className="chat-side">
         <div className="side-head">
-          <b>任务</b>
+          <b>会话</b>
           <button style={{ padding: '3px 10px', fontSize: 12 }} onClick={newSession}>＋ 新建</button>
         </div>
         <div className="side-list">
-          {history.length === 0 ? <div className="empty" style={{ padding: 18 }}>暂无任务，在下方输入需求开始</div> :
-            history.map(t => (
-              <div key={t.task_id} className={`task-item ${t.task_id === activeId ? 'active' : ''}`}
-                onClick={() => openTask(t.task_id)}>
-                <div className="t-title">{t.title || t.task_id}</div>
+          {convs.length === 0 ? <div className="empty" style={{ padding: 18 }}>暂无会话，输入内容开始对话</div> :
+            convs.map(c => (
+              <div key={c.conv_id} className={`task-item ${c.conv_id === convId ? 'active' : ''}`}
+                onClick={() => openConversation(c.conv_id)}>
+                <div className="t-title">{c.title || c.conv_id}</div>
                 <div className="t-meta">
-                  <span className={`badge ${STATUS_CLS[t.status] ?? 'neutral'}`}>
-                    {t.status === 'running' ? `${t.progress}%` : t.status === 'completed' ? '完成' : t.status === 'pending' ? '排队' : '失败'}
-                  </span>
-                  <span className="rel-time">{relTime(t.created_at)}</span>
+                  <span className="rel-time">{relTime(c.updated_at)}</span>
                 </div>
               </div>
             ))}
+        </div>
+        <div className="side-head" style={{ marginTop: 8 }}>
+          <b>任务</b>
+          <span className="hint" style={{ fontSize: 11 }}>{history.length}</span>
+        </div>
+        <div className="side-list" style={{ maxHeight: 200 }}>
+          {history.map(t => (
+            <div key={t.task_id} className={`task-item ${t.task_id === activeId ? 'active' : ''}`}
+              onClick={() => openTask(t.task_id)}>
+              <div className="t-title">{t.title || t.task_id}</div>
+              <div className="t-meta">
+                <span className={`badge ${STATUS_CLS[t.status] ?? 'neutral'}`}>
+                  {t.status === 'running' ? `${t.progress}%` : t.status === 'completed' ? '完成' : t.status === 'pending' ? '排队' : '失败'}
+                </span>
+                <span className="rel-time">{relTime(t.created_at)}</span>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -683,14 +729,14 @@ export function RequirementsPage() {
       <div className="chat-main">
         {/* 引擎条（模型可切换） */}
         <div className="engine-bar">
-          <span className={`badge ${dsh?.ready ? 'ok' : 'warn'}`}>{dsh?.ready ? 'DSH' : 'DSH 未就绪'}</span>
+          <span className={`badge ${dsh?.ready ? 'ok' : dsh?.callable ? 'warn' : 'warn'}`}>{dsh?.ready ? 'DSH' : dsh?.callable ? 'DSH 待验证' : 'DSH 不可用'}</span>
           <ModelBar currentModel={dsh?.model} onOpen={() => setDrawerOpen(true)} />
           <ModelModal open={drawerOpen} currentKey={dsh?.provider_key}
             onClose={() => setDrawerOpen(false)} onChanged={refreshRuntime} />
           {dsh?.provider ? <span>{dsh.provider}</span> : null}
           {dsh?.mode ? <><span className="sep">·</span><span>{dsh.mode} 载体</span></> : null}
-          {!dsh?.api_key_configured ? <span className="badge warn">未配置 Key · 规则分析</span> : null}
-          {mode !== 'auto' ? <span className="badge neutral">模式：{MODE_LABEL[mode]}</span> : (detected ? <span className="badge neutral">识别：{MODE_LABEL[detected]}</span> : null)}
+          {!dsh?.api_key_configured ? <span className="badge warn">未显式配置 Key · 将尝试凭据库</span> : null}
+          {mode !== 'auto' ? <span className="badge neutral">模式：{MODE_LABEL[mode]}</span> : (detected ? <span className="badge neutral" title={intentReason || undefined}>识别：{MODE_LABEL[detected]}{intentReason ? ` · ${intentReason}` : ''}</span> : null)}
           {task ? (
             <><span className="sep" style={{ margin: '0 2px' }}>|</span>
               <span className={`badge ${STATUS_CLS[task.status] ?? 'neutral'}`}>
@@ -698,7 +744,6 @@ export function RequirementsPage() {
               </span>
               <span className="rel-time">耗时 {fmtDuration(task.created_at)}</span></>
           ) : null}
-          {toast ? <span className="badge ok" style={{ marginLeft: 'auto' }}>{toast}</span> : null}
         </div>
 
         {/* 流程轨道：常驻 8-Agent 进度 */}
@@ -709,35 +754,47 @@ export function RequirementsPage() {
             const el = msgsRef.current
             if (el) stickRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 60
           }}>
-          {!task ? (
-            qaMsg ? (
-              <div className="qa-wrap">
-                <div className="qa-q">💬 {qaMsg.q}</div>
-                <div className="qa-a">{qaMsg.a}</div>
-                <div className="hint" style={{ marginTop: 8 }}>问答模式 · 不进入分析流水线</div>
+          {/* 会话消息流（多轮）：user / assistant 问答气泡 + 任务块 */}
+          {messages.map((m, i) => m.task_id ? (
+            <div className="msg-sys" key={i}>
+              <span className={`pill ${m.task_id === activeId ? '' : 'neutral'}`}
+                style={{ cursor: 'pointer' }}
+                onClick={() => m.task_id && openTask(m.task_id)}>
+                📦 {m.content}{m.task_id === activeId ? '（当前）' : ' · 点击查看'}
+              </span>
+            </div>
+          ) : m.role === 'user' ? (
+            <div className="msg-user" key={i}>
+              <div className="bubble">
+                <div style={{ whiteSpace: 'pre-wrap' }}>{m.content.slice(0, 600)}</div>
+                {m.created_at ? <div className="b-meta"><span className="rel-time">{relTime(m.created_at)}</span></div> : null}
               </div>
-            ) : (
-              <div className="welcome">
-                <div className="w-icon">🧭</div>
-                <h4>AI 测试导航 · 需求分析</h4>
-                <p>粘贴需求描述或接口 URL（支持<b>直接粘贴/拖入文档和图片</b>），
-                  8 个 FDE Agent 按上方流程协同完成分析，全程实时可见。</p>
-                <p className="hint" style={{ marginTop: 14 }}>点击上方模型名可管理并切换 API 地址 / Key / 模型 ID</p>
-              </div>
-            )
+            </div>
           ) : (
+            <div className="msg-assistant" key={i}>
+              <div className="bubble-a">
+                <div style={{ whiteSpace: 'pre-wrap' }}>{m.content}</div>
+                {m.intent ? <div className="b-meta"><span className="badge neutral">{MODE_LABEL[m.intent] ?? m.intent}</span></div> : null}
+              </div>
+            </div>
+          ))}
+
+          {/* 当前任务详情块（打开/执行中的任务展开活动流与结果） */}
+          {task ? (
             <>
               {/* 用户消息 */}
-              <div className="msg-user">
-                <div className="bubble">
-                  <div style={{ whiteSpace: 'pre-wrap' }}>{(task.source_text || task.title || '').slice(0, 600)}</div>
-                  <div className="b-meta">
-                    {task.projects ? <span>项目：{task.projects}</span> : <span>项目：自动侦察</span>}
-                    {task.branch ? <span>分支：{task.branch}</span> : null}
-                    <span className="rel-time">{relTime(task.created_at)}</span>
+              {messages.every(m => m.task_id !== activeId) ? (
+                <div className="msg-user">
+                  <div className="bubble">
+                    <div style={{ whiteSpace: 'pre-wrap' }}>{(task.source_text || task.title || '').slice(0, 600)}</div>
+                    <div className="b-meta">
+                      {task.projects ? <span>项目：{task.projects}</span> : <span>项目：自动侦察</span>}
+                      {task.branch ? <span>分支：{task.branch}</span> : null}
+                      <span className="rel-time">{relTime(task.created_at)}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
+              ) : null}
 
               {/* 活动流 */}
               {renderSeq.map((r, i) => r.type === 'sys' ? (
@@ -771,7 +828,16 @@ export function RequirementsPage() {
               {analysis ? <ResultPanel a={analysis} /> :
                 running ? <div className="msg-sys"><span className="pill"><span className="spinner" style={{ width: 10, height: 10, marginRight: 6, verticalAlign: -1 }} />{task.message || '分析中...'}</span></div> : null}
             </>
-          )}
+          ) : messages.length === 0 && !qaMsg ? (
+            <div className="welcome">
+              <div className="w-icon">🧭</div>
+              <h4>AI 测试导航 · 需求分析</h4>
+              <p>粘贴需求描述或接口 URL（支持<b>直接粘贴/拖入文档和图片</b>），
+                8 个 FDE Agent 按上方流程协同完成分析，全程实时可见。</p>
+              <p className="hint" style={{ marginTop: 14 }}>多轮对话：问答、分析、追问都在同一个会话里连续进行</p>
+              <p className="hint">点击上方模型名可管理并切换 API 地址 / Key / 模型 ID</p>
+            </div>
+          ) : null}
         </div>
 
         {/* ── composer：粘贴/拖拽即上传 ────────────────────────────── */}
@@ -817,16 +883,16 @@ export function RequirementsPage() {
           </div>
           <textarea ref={inputRef} value={text} onChange={e => setText(e.target.value)} rows={3}
             onPaste={onPaste}
-            placeholder="输入需求描述或接口 URL，可直接粘贴/拖入文档图片，Ctrl+Enter 发送..."
+            placeholder="输入需求描述、接口 URL 或直接提问（支持追问），Ctrl+Enter 发送..."
             onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run() }} />
           <div className="c-foot">
             <span className="hint">
               {formErr ? <span style={{ color: '#b42318' }}>{formErr}</span> :
-                running ? '当前任务分析中，完成后可继续提交' :
+                running ? '当前任务分析中，完成后可继续提问' :
                   files.length > 0 ? `${files.length} 个附件待提交` :
-                    selProjects.length > 0 ? `已指定 ${selProjects.length} 个项目` : '项目未指定，将由侦察 Agent 自动判断'}
+                    selProjects.length > 0 ? `已指定 ${selProjects.length} 个项目` : '多轮对话 · 问答与分析在同一会话连续进行'}
             </span>
-            <button onClick={run} disabled={running}>{mode === 'qa' ? '发送' : '开始分析'}</button>
+            <button onClick={run} disabled={busy}>{mode === 'qa' ? '发送' : '发送'}</button>
           </div>
         </div>
       </div>

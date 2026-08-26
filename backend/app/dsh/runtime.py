@@ -47,6 +47,9 @@ class DshRuntimeManager:
         cfg = self._resolve_provider_config() or {}
         return {
             "ready": s.dsh_ready,
+            # 2026-08-25 铁律：ready 仅是静态展示（源码+Key+载体齐备）；
+            # callable 才是真相——start() 不做 Key 前置拦截，DSH 凭据库可能持有 Key。
+            "callable": s.dsh_source_available and (s.dsh_mode != "node" or s.dsh_node_carrier_available),
             "source_available": s.dsh_source_available,
             "node_carrier_available": s.dsh_node_carrier_available,
             "mode": s.dsh_mode,
@@ -66,6 +69,8 @@ class DshRuntimeManager:
         """从 model_configs 表解析当前要用的供应商配置（优先选中项，否则默认项）。
 
         回退策略：DB 无配置/未建表时回退到 settings 凭证（兼容环境变量/凭据文件场景）。
+        api_key 允许为空：DSH 凭据库（~/.dsh/.credentials.yaml）可能持有 Key，
+        由 SDK 自行解析——平台不做「无 Key 就拒绝启动」的前置拦截。
         """
         fallback = {
             "provider": self.settings.dsh_provider,
@@ -96,18 +101,28 @@ class DshRuntimeManager:
     # ---------- 生命周期 ----------
 
     def start(self) -> bool:
-        """懒启动 Runtime；失败时记录原因并返回 False（调用方走规则分析兜底）。"""
-        if not self.settings.dsh_ready:
-            self.last_error = "DSH 未就绪（源码/node 载体/API Key 缺失）"
-            return False
+        """懒启动 Runtime：不做静态前置拦截（2026-08-25 用户铁律）——尽可能尝试调起模型。
+
+        凭据解析优先级：model_configs 表（用户可能在设置页存过 Key）→ 环境变量/凭据文件
+        → DSH 自身凭据库（api_key=None 时 SDK 自行解析）。静态 dsh_ready 仅作状态展示，
+        不作为调用闸门；只有真正启动失败（源码缺失/载体缺失/启动抛错）才返回 False。
+        """
         with self._lock:
             if self._harness is not None:
                 return True
+            if not self.settings.dsh_source_available:
+                self.last_error = "DSH 源码不可用（deepseek-harness 仓库未找到）"
+                return False
             try:
                 cfg = self._resolve_provider_config()
                 if not cfg or not cfg.get("model_id"):
                     self.last_error = "无可用模型供应商配置"
                     return False
+                if self.settings.dsh_mode == "node" and not self.settings.dsh_node_carrier_available:
+                    self.last_error = "node 载体未构建（scripts/build-dsh-node-carrier.mjs）"
+                    return False
+                # Key 缺失不拦截：api_key=None 时 SDK 自行从 DSH 凭据库解析
+                #（2026-08-25 用户铁律：尽可能调起模型，不前置拒绝）。
                 dh = self._import_harness()
                 import os
 

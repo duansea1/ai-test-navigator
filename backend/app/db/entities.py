@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS code_evidence (
   symbol VARCHAR(256) COMMENT '符号名（函数/类/变量）',
   summary TEXT COMMENT '代码摘要',
   relevance VARCHAR(32) COMMENT '相关度：high/medium/low',
+  req_ref VARCHAR(64) COMMENT '关联需求 ID（REQ-xxx）',
   created_at DATETIME NOT NULL COMMENT '创建时间',
   INDEX idx_ev_task (task_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='代码证据表'
@@ -180,6 +181,30 @@ CREATE TABLE IF NOT EXISTS model_configs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模型供应商配置表'
 """
 
+_CONVERSATIONS = """
+CREATE TABLE IF NOT EXISTS conversations (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+  conv_id VARCHAR(64) NOT NULL UNIQUE COMMENT '会话唯一标识（对外 ID）',
+  title VARCHAR(512) NOT NULL DEFAULT '新会话' COMMENT '会话标题（首条消息截断）',
+  created_at DATETIME NOT NULL COMMENT '创建时间',
+  updated_at DATETIME NOT NULL COMMENT '更新时间',
+  INDEX idx_conv_updated (updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户会话表（多轮对话载体）'
+"""
+
+_CHAT_MESSAGES = """
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+  conv_id VARCHAR(64) NOT NULL COMMENT '关联会话 ID',
+  role VARCHAR(16) NOT NULL COMMENT '角色：user/assistant',
+  content TEXT COMMENT '消息内容',
+  intent VARCHAR(16) COMMENT '意图标签（assistant 消息）：qa/analyze/full',
+  task_id VARCHAR(64) COMMENT '关联分析任务 ID（analyze/full 消息）',
+  created_at DATETIME NOT NULL COMMENT '创建时间',
+  INDEX idx_cm_conv (conv_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话消息表'
+"""
+
 
 def _sqlite(ddl: str) -> list[str]:
     """MySQL DDL → SQLite：去引擎/表注释子句、AUTO_INCREMENT→AUTOINCREMENT、索引单独建。"""
@@ -220,7 +245,7 @@ def _build_sqlite_schema() -> list[str]:
     stmts: list[str] = []
     for ddl in (_TASKS, _REQUIREMENTS, _CODE_EVIDENCE, _IMPACT, _TEST_CASES,
                 _TEST_RUNS, _ASSESSMENTS, _REPORTS, _AGENT_SESSIONS, _DSH_EVENTS,
-                _MODEL_CONFIGS):
+                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES):
         stmts.extend(_sqlite(ddl))
     # SQLite 索引
     for tbl, col in [("analysis_tasks", "status"), ("analysis_tasks", "created_at"),
@@ -229,14 +254,15 @@ def _build_sqlite_schema() -> list[str]:
                      ("test_runs", "task_id"), ("assessments", "task_id"),
                      ("reports", "task_id"), ("agent_sessions", "task_id"),
                      ("dsh_events", "task_id"), ("model_configs", "is_default"),
-                     ("model_configs", "enabled")]:
+                     ("model_configs", "enabled"), ("conversations", "updated_at"),
+                     ("chat_messages", "conv_id")]:
         stmts.append(f"CREATE INDEX IF NOT EXISTS idx_{tbl}_{col} ON {tbl} ({col})")
     return stmts
 
 
 SCHEMA_MYSQL = [_TASKS, _REQUIREMENTS, _CODE_EVIDENCE, _IMPACT, _TEST_CASES,
                 _TEST_RUNS, _ASSESSMENTS, _REPORTS, _AGENT_SESSIONS, _DSH_EVENTS,
-                _MODEL_CONFIGS]
+                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES]
 SCHEMA_SQLITE = _build_sqlite_schema()
 
 
@@ -363,6 +389,7 @@ def fail_stale_tasks() -> int:
 _MIGRATIONS = [
     ("assessments", "risk", "VARCHAR(16)"),
     ("assessments", "gaps", "TEXT"),
+    ("code_evidence", "req_ref", "VARCHAR(64)"),
 ]
 
 
@@ -378,16 +405,17 @@ def _migrate_columns() -> None:
 # ─── repository：code_evidence / impact_scopes / test_cases / assessments ───
 
 def save_code_evidence(task_id: str, evidence: list[dict[str, Any]]) -> int:
-    """代码证据入库（code-locator 输出，先清旧）。"""
+    """代码证据入库（code-locator 输出，先清旧；req_ref 关联需求条目）。"""
     engine.execute("DELETE FROM code_evidence WHERE task_id = ?", (task_id,))
     for ev in evidence:
         engine.insert(
-            "INSERT INTO code_evidence (task_id, project, path, line_no, symbol, summary, relevance, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO code_evidence (task_id, project, path, line_no, symbol, summary, relevance, req_ref, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (task_id, str(ev.get("project", ""))[:120], str(ev.get("path", ""))[:1000],
              _to_int(ev.get("line")), str(ev.get("symbol", ""))[:250],
              str(ev.get("snippet", ev.get("summary", "")))[:4000],
-             str(ev.get("confidence", ""))[:30], _now()),
+             str(ev.get("confidence", ""))[:30],
+             str(ev.get("requirement_id", ""))[:60], _now()),
         )
     return len(evidence)
 
@@ -496,6 +524,68 @@ def list_report_views(task_id: str) -> dict[str, Any]:
         return {}
     data = engine.loads(row.get("summary"), {})
     return data.get("views", {}) if isinstance(data, dict) else {}
+
+
+# ─── repository：conversations / chat_messages（多轮会话，M3.2a）──────────────
+
+def create_conversation(title: str = "新会话") -> str:
+    conv_id = f"conv-{uuid.uuid4().hex[:12]}"
+    now = _now()
+    engine.insert(
+        "INSERT INTO conversations (conv_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        (conv_id, title[:500], now, now),
+    )
+    return conv_id
+
+
+def touch_conversation(conv_id: str, title: str | None = None) -> None:
+    """会话有新消息：刷新 updated_at；首条用户消息定标题。"""
+    if title:
+        engine.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? WHERE conv_id = ?",
+            (title[:500], _now(), conv_id),
+        )
+    else:
+        engine.execute(
+            "UPDATE conversations SET updated_at = ? WHERE conv_id = ?",
+            (_now(), conv_id),
+        )
+
+
+def list_conversations(limit: int = 50) -> list[dict[str, Any]]:
+    return engine.query(
+        "SELECT conv_id, title, created_at, updated_at FROM conversations "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (limit,),
+    )
+
+
+def get_conversation(conv_id: str) -> dict[str, Any] | None:
+    return engine.query_one(
+        "SELECT conv_id, title, created_at, updated_at FROM conversations WHERE conv_id = ?",
+        (conv_id,),
+    )
+
+
+def save_message(conv_id: str, role: str, content: str,
+                 intent: str = "", task_id: str = "") -> None:
+    """追加一条会话消息（user / assistant）；task_id 关联分析任务块。"""
+    engine.insert(
+        "INSERT INTO chat_messages (conv_id, role, content, intent, task_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (conv_id, role, content, intent or None, task_id or None, _now()),
+    )
+
+
+def list_messages(conv_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    """会话消息按时间正序（先取最新 limit 条再反转，长会话只带尾部上下文）。"""
+    rows = engine.query(
+        "SELECT role, content, intent, task_id, created_at FROM chat_messages "
+        "WHERE conv_id = ? ORDER BY id DESC LIMIT ?",
+        (conv_id, limit),
+    )
+    rows.reverse()
+    return rows
 
 
 # ─── repository：dashboard 聚合 ──────────────────────────────────────────────

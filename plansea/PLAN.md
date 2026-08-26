@@ -4,31 +4,67 @@
 >
 > 目标：输入需求文档与测试环境源码，自动识别需求实现情况、代码证据、影响范围、验证范围和测试结果，输出可追溯的可视化质量报告。
 >
-> 最后更新：2026-08-20
+> 最后更新：2026-08-24（计划校准：状态同步至 M3.0，锁定产品核心，重排后续路线）
 >
-> 当前阶段：Phase 1 MVP 已完成，页面体验入口已补齐，进入报告体验、视觉输入适配与测试执行增强阶段。
+> 当前阶段：**M3.0 已完成**。核心链路（需求输入 → 意图识别 → 8-Agent 分析 → 证据/用例/裁决 → 三视角报告）已在核心入口全链路可用。
 >
-> 能力图谱基线：[`FDE_CAPABILITY_MAP.md`](./FDE_CAPABILITY_MAP.md)。该文件完整保存 7 大模块、35 个能力点、典型产出和 FDE 完整链路；本计划不得脱离该基线推进。
+> 能力图谱基线：[`FDE_CAPABILITY_MAP.md`](./FDE_CAPABILITY_MAP.md)。交付真相源（迭代记录）：[`CHANGELOG.md`](./CHANGELOG.md)。
 
 ---
 
-## 1. 产品目标
+## 0. 产品核心（不可变，2026-08-24 用户确认）
 
-AI Test Navigator 不是单纯的代码问答工具，而是一条可回验的质量分析流水线：
+### 0.1 核心入口
+
+**唯一核心入口：`http://localhost:8090/#/requirements`（需求分析页，聊天式工作台）。**
+
+主链路：
 
 ```text
-需求文档
-  -> 需求结构化
-  -> 项目与代码定位
-  -> 调用链和数据影响分析
-  -> 需求-实现比对
-  -> 测试范围与用例设计
-  -> 自动化测试执行
-  -> 结果归因
-  -> HTML/JSON/Markdown 报告
+粘贴需求文字 / 接口 URL / 文档附件
+  → 意图识别（intent-classifier：问答 / 需求分析 / 全流程）
+  → 问答直接回答（qa-assistant）或进入 8-Agent 分析流水线
+  → 实时 Agent 活动流（SSE：工具调用 / 模型思考 / 阶段结论）
+  → 结构化结果面板（需求 / 证据 / 链路 / 用例 / 裁决 / 三视角）
+  → HTML / JSON / Markdown 报告
 ```
 
-核心原则：
+一句话定位：帮助研发团队回答——这项需求是否真的实现、影响了什么、该验证什么、哪些结论可信、谁需要复核。
+
+其余菜单域（工作台 / 项目管理 / Agent 编排 / 测试中心 / 报告中心 / 证据中心 / 系统设置）均为该主链路的支撑或展示面，不另立产品线。
+
+### 0.2 核心资产：8-Agent 流水线（各阶段角色与能力）
+
+Agent 定义于 `backend/app/dsh/agents.py`，编排在 `backend/app/services/orchestrator.py`：
+每个 Agent 独立 DSH 会话（`{task_id}--{agent_id}`，防上下文串味）；单阶段失败降级跳过，任务不失败；DSH 不可用时整链降级规则分析（`services/analyzer.py` 阶段 0 保底）。各阶段输出统一经 `services/agent_validation.py` 强校验（REQ-xxx 强制 / 枚举收敛 / fail 必须有证据 / 修复丢弃计数进活动流）后才入库——不合法结论拒绝入库是本表输出契约的执行层（M2.3）。
+
+| # | Agent ID | 角色 | 阶段能力 | 输出契约 | 落库 |
+|---|---|---|---|---|---|
+| 0 | intent-classifier | 意图识别 | 判断输入属于 问答 / 需求分析 / 全流程 | IntentResult | —（仅路由） |
+| 0' | qa-assistant | 问答助手 | 工具能力 / 测试方法论问答 | Answer | — |
+| 1 | requirement-analyst | 需求分析 | 需求拆结构化条目：角色、规则、输入输出、验收标准 | RequirementItem[] | requirements |
+| 2 | project-scout | 项目侦察 | 项目相关性判断，确认分支 / commit / 扫描范围 | ProjectRelevance[] | 内存（供后续阶段） |
+| 3 | code-locator | 代码定位 | 经 glob/grep/read 实查源码，定位 Controller/Service/Biz/Mapper 入口 | CodeEvidence[] | code_evidence |
+| 4 | call-chain | 调用链 | 前端→网关→服务→数据库跨项目调用关系与影响范围 | CallChain[] | impact_scopes |
+| 5 | impl-reviewer | 实现审查 | 逐条需求-实现比对，判定实现状态与缺口 | RequirementAssessment[] | assessments（与 7 合并） |
+| 6 | test-designer | 测试设计 | 正常 / 异常 / 边界 / 幂等 / 权限五类用例 | TestCase[] | test_cases |
+| 7 | quality-judge | 质量裁决 | 证据归因 → 风险等级 + 上线建议 | QualityVerdict[] | assessments |
+| 8 | report-writer | 报告 | 研发 / 测试 / 产品三视角结论摘要 | ReportViews | reports |
+
+### 0.3 DSH 融合策略（基于 / 二开，不从零开发）
+
+Agent Runtime 层**不自研**。推理、工具、子代理、工作流、长会话等能力全部来自 DeepSeek Harness（DSH），平台只做编排与领域适配：
+
+1. **源码集成**：DSH Python SDK 以 sys.path 源码注入（`python/sdk/src` + `sdk-runtime/src`），上游 `git pull` 即升级，无需 pip。
+2. **满血组合**：`config/cordis.yml` 挂载插件组合——原生子代理（spawn/fork）、Claude Code 子代理桥、workflow + ralph 自主循环、Skills、fs 全套（glob/grep/read/write）、todo/jobs、token-meter + compaction 长会话压缩。
+3. **Windows node 载体**：`scripts/build-dsh-node-carrier.mjs` 离线构建 356 包闭包。
+4. **凭据链路**：后端解析 `~/.dsh/.credentials.yaml`，经子进程环境注入（密钥不落配置文件）。
+5. **模型治理**：`model_configs` 表多供应商管理 + 运行时热切换（M2.2，切换即对新任务生效）。
+6. **平台 Skills**：`skills/` 目录经 `DSH_CUSTOM_SKILL_DIRS` 注入，分析标准沉淀为 Skill 而非硬编码。
+
+**工具平台雷达（每次迭代例行）**：先查 DSH 上游是否有新插件 / 新模型 / 新能力 → cordis 挂载 + `scripts/smoke-dsh.py` 验证 → 平台编排接入；只有上游确实没有时才评估自研。
+
+### 0.4 核心原则（不变）
 
 1. **证据优先**：每个判断关联文件、行号、符号、命令输出或测试证据。
 2. **不确定性显式化**：没有找到证据时标记 `needs_review`，不直接当成缺陷。
@@ -37,331 +73,163 @@ AI Test Navigator 不是单纯的代码问答工具，而是一条可回验的�
 5. **测试环境基线**：涉及测试环境代码时，默认使用 `integration` 分支。
 6. **安全降级**：没有 DSH Runtime 或 API Key 时仍能运行本地规则分析。
 
----
+### 0.5 范围裁决（2026-08-24）
 
-## 1A. 对照 FDE 工程师能力图谱：7 大模块 × 35 个能力点
-
-这张能力图谱不是额外的宣传页，而是本项目的完整能力边界。后续每次迭代都要说明覆盖了哪些能力点、产出了什么结果、哪些仍需人工确认。
-
-### 模块 01：业务诊断能力
-
-目标：把模糊需求拆成真实业务问题。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| 流程识别 | 从需求、接口和代码中识别业务流程与关键节点 | 业务流程图 |
-| 角色访谈 | 通过需求字段、角色和权限建模替代/辅助访谈 | 角色与诉求清单 |
-| 痛点排序 | 按 P0-P3、风险和影响范围排序 | 优先级矩阵 |
-| ROI 假设 | 估算自动化测试、回归分析和缺陷预防收益 | ROI/价值假设 |
-| 边界确认 | 识别需求范围、前置条件、异常和不确定项 | 范围与约束清单 |
-
-### 模块 02：场景建模能力
-
-目标：把业务问题转成 AI 可以介入的任务链路。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| 任务拆解 | 把需求分析拆成扫描、定位、影响分析、测试、报告任务 | 任务链路图 |
-| 输入输出定义 | 定义需求、源码、环境、日志和报告的数据模型 | I/O 定义 |
-| 人机协同 | 明确规则引擎、Agent、测试执行器和人工审核分工 | 人机协同方案 |
-| 异常分支 | 区分无证据、代码未实现、测试失败、环境阻塞 | 异常分支矩阵 |
-| 闭环设计 | 从需求输入到报告、人工确认和经验回写形成闭环 | 流程原型 |
-
-### 模块 03：AI 方案设计能力
-
-目标：判断何时使用 RAG、Agent、工作流或传统程序。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| 模型选型 | 根据任务复杂度选择规则、DSH Agent 或混合模式 | 技术方案 |
-| RAG 设计 | 使用 PROJECT_INDEX、源码索引和历史报告作为检索上下文 | 知识检索方案 |
-| Agent 边界 | 为需求、代码、调用链、测试和质量裁决定义职责 | Agent 架构 |
-| Prompt 策略 | 规定证据引用、结构化输出、置信度和降级策略 | Prompt/Skill 规范 |
-| 工具编排 | 编排 Git、文件扫描、测试命令、API、浏览器和报告工具 | 工具链方案 |
-
-### 模块 04：工程实现能力
-
-目标：把方案从文档推进到可运行系统。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| API 集成 | 集成 FastAPI、DSH Python SDK、测试工具和报告接口 | 接口服务 |
-| 数据处理 | 处理需求、源码、证据、日志、测试结果和报告数据 | 数据管道 |
-| 原型开发 | 以 CLI、FastAPI 和 HTML 报告快速验证闭环 | MVP/Demo |
-| 自动化工作流 | 编排分析阶段、测试执行、重试和结果归因 | 自动化脚本 |
-| 服务化部署 | 后续提供统一 Web 服务、任务队列和可维护部署 | 服务部署方案 |
-
-### 模块 05：系统集成能力
-
-目标：把 AI 测试能力接进企业原有系统，而不是停留在聊天窗口。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| CRM 集成 | 预留业务需求、客户和项目元数据接入能力 | 集成方案 |
-| ERP 集成 | 预留研发项目、版本和环境信息接入能力 | 集成方案 |
-| 工单系统集成 | 支持从需求/缺陷工单创建分析任务 | 工单集成方案 |
-| 企业 IM 集成 | 后续推送高风险报告、阻塞和上线提醒 | IM 集成方案 |
-| 权限体系集成 | 对项目、源码、报告、测试环境建立权限与 SSO 体系 | 权限设计 |
-
-### 模块 06：评测治理能力
-
-目标：判断 AI 输出是否稳定、可信、可上线。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| Eval 设计 | 建立需求解析、代码定位、影响分析和报告质量评测集 | 评测集 |
-| 准确率评估 | 评估需求覆盖、证据命中、误报、漏报和结论准确性 | 上线标准 |
-| 幻觉控制 | 强制证据引用、Pydantic 校验和 needs_review 状态 | 风险控制 |
-| 人工复核 | 为高风险、低置信度和冲突结论保留人工审核机制 | 复核机制 |
-| 日志监控 | 保存 Agent、命令、测试、环境和报告生成日志 | 监控看板 |
-
-### 模块 07：落地推动能力
-
-目标：让团队真正使用起来，并把经验沉淀为可复制方法。
-
-| 能力点 | 本项目对应能力 | 典型产出 |
-|---|---|---|
-| 用户培训 | 提供 CLI、Web、报告和审核流程使用说明 | 培训材料 |
-| 试点推进 | 先以护照 OCR 链路作为样板，再扩展其他业务域 | 试点报告 |
-| 数据追踪 | 追踪需求覆盖、缺陷、测试通过率、阻塞和使用效果 | 指标看板 |
-| 反馈闭环 | 将人工确认、误报和漏报回写规则、Skills 和索引 | 持续改进 |
-| 经验产品化 | 沉淀最佳实践模板、行业规则和可复用 Agent | 最佳实践模板 |
-
-### 7 模块的完整链路
-
-```text
-业务问题
-  -> AI 方案
-  -> 工程实现
-  -> 系统集成
-  -> 稳定上线
-  -> 业务采用
-  -> 产品反馈
-```
-
-当前覆盖状态：
-
-- **已覆盖**：模块 01 的基础需求拆解、模块 02 的任务链路、模块 03 的混合架构、模块 04 的 MVP/API/报告、模块 07 的护照 OCR 试点。
-- **部分覆盖**：模块 01 的流程识别、模块 02 的闭环、模块 03 的 RAG/工具编排、模块 06 的证据约束。
-- **待建设**：模块 05 企业系统集成、模块 06 完整评测治理、模块 07 指标追踪和规模化推广。
+- **核心不变**：核心入口 `/#/requirements` + 8-Agent 各阶段角色与能力。
+- **超出核心的不管**：企业集成（CRM / ERP / 工单 / IM / SSO / GitLab MR / CI 门禁）、多租户权限、评测集规模化等记为扩展项，**不排期**；FDE 图谱模块 05 整体搁置（标记 ⏸）。
+- 与能力图谱的关系：图谱仍是长期范围基线，但执行顺序以本计划核心为准；搁置项见 [`FDE_CAPABILITY_MAP.md`](./FDE_CAPABILITY_MAP.md) 检查清单标记。
 
 ---
 
-## 2. 当前技术架构
+## 1. 里程碑状态（截至 2026-08-24）
+
+交付细节以 [`CHANGELOG.md`](./CHANGELOG.md) 为准，本表只做索引：
+
+| 里程碑 | 交付 | 状态 |
+|---|---|---|
+| Phase 1 MVP | 规则分析 + 三格式报告 + FastAPI | ✅ 完成 |
+| M0 | 商用级架构重构：8 菜单域 + DSH Runtime 全链路 + React 前端 | ✅ 完成 |
+| M1 | DB 持久化（11 表）+ 异步任务流 + SSE 进度 | ✅ 完成 |
+| M2 | 8-Agent 语义分析流水线 + 全景结果 + 多 tab 前端 | ✅ 完成 |
+| M2.1 | 聊天式重构：Agent 活动实时流式输出（/activity SSE） | ✅ 完成 |
+| M2.2 | 需求分析页体验升级：模型热切换 / 粘贴拖拽 / 流程轨道 / 结果面板 v2 | ✅ 完成 |
+| M2.3 | Agent 输出强校验层：REQ-xxx 强制 / 枚举收敛 / fail 必须有证据 / ValidationReport | ✅ 完成 |
+| M3.0 | 全局交互升级：Ctrl+K 命令面板 / 可折叠侧栏 / 全局 Toast / Dashboard 可视化 / 空状态 | ✅ 完成（浏览器人工验收待做） |
+| M3.1 | 核心体验收尾：命令面板最近任务 / 三中心空状态 / y 轴刻度 / 技术债清理 / 4 处文案修正 | ✅ 完成（构建与浏览器验收待补） |
+| M3.2a | Agent 能力优化 + 多轮会话：10 Agent prompt 收紧 + 3 Skill 补齐 + call-chain steps 修复 + conversations/chat_messages（13 表）+ 校验失败重问 + 证据关联需求 | ✅ 完成（冒烟 108/0 通过；构建与浏览器待补） |
+| M3.2b | Agent 子代理赋能：每个流水线 Agent 升级为该阶段「主理」（对契约输出全权负责），能力不足时按 fork（同质并行/交叉验证）/ spawn（异质分治）委派再合成；新建 agent-collaboration 共享 Skill；路由层 2 Agent 轻量不委派 | ✅ 完成（冒烟 108/0 通过；DSH 真实委派待浏览器验收） |
+
+---
+
+## 2. 路线图（校准后）
+
+> 原 Phase 2-6 按「核心优先」重排为 M3.1 → M3.2 → M4 → M5；移出的项见 §3 P2 扩展项。
+
+### M3.1 — 核心入口体验收尾（已完成 2026-08-25）
+
+- 命令面板（Ctrl+K）接入「最近任务」快速打开。
+- 报告中心 / 证据中心 / 测试中心空状态统一迁移 EmptyState。
+- Dashboard 趋势图 y 轴自适应刻度。
+- 清理 `requirements.tsx` 的 `toastUnused` 占位与未使用 import。
+- 修正过期文案 4 处（报告中心 / 证据中心 / 项目管理页 / README）。
+
+验收：esbuild 构建通过 + 8090 浏览器验收（Ctrl+K 打开最近任务、各中心空状态、趋势图刻度）。⚠️ 本轮分类器故障构建未跑，待补。
+
+### M3.2 — 人工复核流（「不确定性显式化」的闭环）
+
+- `needs_review` 结论状态流转 API（确认 / 误报 / 漏报）+ 报告中心操作入口。
+- 需求条目 ID 强制 `REQ-xxx` 规范（入库前校验）。
+- 人工复核结论写入 `feedback_items` 表（新建）。
+- 复核时固化轻量快照（需求输入、模型、commit）与复核人 / 时间留痕（审计基础）；复核结论沉淀为后续评测样本。
+
+验收：一条 needs_review 结论可在页面上被人工确认并留痕；复核数据可查询。
+
+### M4 — 测试执行引擎（核心版）
+
+- 白名单命令 + dry-run 先行；默认只读，禁止生产环境连接。
+- `test_runs` 表真实写入（命令 / 退出码 / 耗时 / 日志摘要）。
+- 测试失败自动归因到需求条目。
+- 首个支持目标从 Maven 单测 / pytest 二选一（以真实试点项目为准）。
+
+验收：护照 OCR 或 customer 登录示例至少一条真实测试命令执行、入库并归因。
+
+### M5 — 证据深度（核心版）
+
+- `PROJECT_INDEX` 作为 code-locator / call-chain 的知识源输入（FDE 能力点：RAG 设计）。
+- 调用链 Mermaid 可视化（结果面板 + HTML 报告）。
+- 证据中心从占位页升级为真实代码证据检索。
+
+验收：护照 OCR 示例识别跨项目链路（商户端 → international-core → customer-core → admin-core → 运营后台），并区分「未找到」与「证据不足」。
+
+### M6+ — 扩展项（不排期）
+
+见 §3 P2。触发条件：核心链路稳定 + 用户明确提出。
+
+---
+
+## 3. 未完成清单
+
+### P0（下一迭代：M3.2）
+
+- [x] 命令面板接入最近任务（M3.1 完成）
+- [x] 各中心空状态统一 EmptyState（M3.1 完成：报告/证据/测试中心）
+- [x] Dashboard 趋势图 y 轴自适应刻度（M3.1 完成）
+- [x] 清理 requirements.tsx 技术债（toastUnused / 未用 import）（M3.1 完成）
+- [x] 报告中心过期文案修正（M3.1 完成，共 4 处：报告/证据/项目页 + README）
+- [x] 多轮会话（M3.2a 完成：conversations/chat_messages 13 表 + 会话级 DSH 路由 + /api/chat 对话回合 + 前端线程化）
+- [x] Agent prompt 契约收紧 + 3 个空 Skill 补齐（M3.2a 完成）
+- [x] call-chain steps 校验修复 + code-locator 证据关联需求（M3.2a 完成：req_ref 列 + 归并）
+- [x] Agent 子代理赋能（M3.2b 完成：8 流水线 Agent 升级主理 + fork/spawn 委派再合成 + agent-collaboration Skill + 路由层轻量不委派；冒烟 [15] 108/0）
+- [ ] needs_review 人工复核流（状态流转 + 报告中心 UI + feedback_items 表）
+- [ ] 需求条目 ID 强制 REQ-xxx 规范（M2.3 校验层已强制；入库路径兜底见 M3.2 验收）
+- [ ] M3.0/M3.1/M3.2a/M3.2b 浏览器人工验收（Ctrl+K 最近任务 / Ctrl+B / Toast / 趋势图刻度 / 意图徽章 reason / 多轮对话连续性 / 子代理委派活动流）
+- [x] 补跑 `python scripts/smoke-agents.py`（M2.3 + 路由 [10][11] + M3.2a [12][13][14] + M3.2b [15]，108 PASS / 0 FAIL）
+- [ ] 补跑前端构建 `cd frontend && node ../scripts/build-frontend.mjs`（M3.1 + M3.2a 会话流）
+- [ ] 重启 8090 实测「你好」→ 追问「帮我分析个登录需求」→ 问答追问：验证会话连续性与模型真实被调
+
+### P1（核心增强：M4 / M5）
+
+- [ ] 测试执行引擎：白名单 + dry-run + test_runs 入库 + 失败归因
+- [ ] PROJECT_INDEX 知识源接入（code-locator / call-chain 上下文）
+- [ ] Mermaid 调用链可视化
+- [ ] 证据中心真实检索页（替换占位）
+- [x] Agent 输出强校验（M2.3 已落地：`services/agent_validation.py` — REQ-xxx 强制 / 枚举收敛 + 中文别名 / confidence 钳制 / fail 必须有证据 / ValidationReport 进活动流；冒烟 `scripts/smoke-agents.py`）
+- [ ] 评测基线：护照 OCR + customer 登录 golden case 标注与回归脚本（复核结论沉淀为样本）
+- [ ] 安全治理迁移：`model_configs.api_key` 明文改引用 / 加密 + 收紧默认 root:root 连接（企业化前置）
+- [ ] `/api/analyze` 上传接口测试补齐（smoke-e2e 覆盖）
+
+### P2（扩展项，不排期）
+
+- [ ] OCR / 视觉需求输入（见 [`VISION_INPUT.md`](./VISION_INPUT.md) 路线 C：OCR 文本 + 原图证据 + 视觉模型）
+- [ ] 评测集规模化与准确率 / 误报 / 漏报指标（golden case 基线见 P1）
+- [ ] 路由兜底率监控埋点（降级次数/原因可查；M3.2 feedback_items 表落地时顺带设计）
+- [ ] Memory 架构（对话上下文/用户偏好记忆；M4 后按真实使用痛点再议）
+- [ ] Guardrails 独立护栏层（防注入/防泄露；当前内部输入源风险低）
+- [ ] 任务取消 / 重试 / 队列化
+- [ ] GitLab MR 自动分析 / CI 质量门禁
+- [ ] 企业 IM / 工单 / SSO 集成
+- [ ] 报告版本对比 / 历史趋势看板
+
+---
+
+## 4. 当前技术架构（实际）
 
 ```text
-React + TypeScript（计划中的可视化前端）
+React 18 + TypeScript + esbuild（hash 路由，核心入口 /#/requirements）
                 |
-             HTTP API
+        HTTP API + SSE（FastAPI, :8090）
                 |
-FastAPI + Python 编排层
+   orchestrator.py（任务编排：规则保底 + 8-Agent 流水线）
                 |
-  +-------------+-------------+
-  |             |             |
-源码索引器    测试执行器    报告生成器
-  |             |             |
-Java/Vue     Maven/npm/API  JSON/MD/HTML
-                |
-       DSH Python SDK（可选）
-                |
-       Skills + 多 Agent
+      +---------+----------+----------------+
+      |         |          |                |
+  DSH Runtime  规则分析器  轻量 DAL         报告生成器
+  (cordis 满血  analyzer   MySQL/SQLite     JSON/MD/HTML
+   子代理/工作流  .py       11 表           (reporter.py)
+   /Skills)
 ```
 
-当前代码目录：
+代码目录：
 
 ```text
-backend/       Python 模型、分析服务、报告服务、FastAPI
-frontend/      前端预留目录
-skills/        可复用分析标准
-requirements/  示例需求文档
-reports/       生成的报告
-plansea/       总体计划、能力图谱、数据库约定和迭代记录
-.env.example   本地开发环境变量模板
+backend/app/api/         8 个菜单域路由（dashboard/requirements/projects/agents/testing/reports/evidence/settings）
+backend/app/services/    orchestrator（编排）、analyzer（规则保底）、reporter（报告）
+backend/app/dsh/         runtime.py（DSH 长驻管理）、agents.py（8+2 Agent 注册表）
+backend/app/db/          engine + entities（双方言轻量 DAL）
+frontend/src/            React 前端（esbuild 构建，非 Vite）
+config/cordis.yml        DSH 满血插件组合
+skills/                  可复用分析标准（经 DSH_CUSTOM_SKILL_DIRS 注入）
+scripts/                 构建（build-frontend / build-dsh-node-carrier）+ 冒烟（smoke-dsh / smoke-db / smoke-e2e）
+plansea/                 本计划、能力图谱、数据库约定、迭代记录
+reports/                 生成的报告
+requirements/            示例需求文档
 ```
 
 ---
 
-## 3. 迭代路线图
+## 5. 数据对象与状态
 
-### Phase 0：方案与基础设施
-
-状态：**已完成**
-
-交付内容：
-
-- 确认 Python 后端 + 前端单项目架构。
-- 确认 DSH Python SDK + Skills 混合模式。
-- 确认 `C:\Akua` 多项目工作区与 `integration` 测试基线。
-- 设计需求、证据、影响、测试用例和结论数据模型。
-
-验收标准：
-
-- 架构能够支持需求分析、测试执行和报告展示。
-- DSH 不可用时有离线降级路径。
-
-### Phase 1：分析 MVP
-
-状态：**已完成**
-
-交付内容：
-
-- 支持直接输入需求文字、上传需求文档、图片和多个附件。
-- Markdown 需求项提取。
-- Java、Vue、JavaScript 关键词源码扫描。
-- Git commit 采集。
-- 代码证据模型。
-- 项目级影响范围初步识别。
-- 五类测试用例生成：正常、异常、边界、幂等、权限/依赖。
-- JSON、Markdown、HTML 报告。
-- FastAPI 健康接口与分析接口。
-- 护照 OCR 示例需求端到端运行。
-- DSH 可选适配和无 Key 降级。
-
-当前示例报告：
-
-```text
-reports/RPT-ea08576f2d.md
-reports/RPT-ea08576f2d.json
-reports/RPT-ea08576f2d.html
-```
-
-验收结果：
-
-- 需求项：6 条
-- 代码证据：30 条
-- 影响区域：3 个
-- 测试用例：30 条
-- 所有结论均明确标记为已确认或待评审
-
-已知限制：
-
-- 当前关键词扫描仍可能产生误命中或漏命中。
-- 需求条目解析仍以 Markdown 标题和列表为主。
-- 还没有执行真实 Maven、npm、API 或浏览器测试。
-
-### Phase 2：代码理解与影响分析增强
-
-状态：**待开发**
-
-对应 FDE 能力点：01 流程识别、01 边界确认、02 任务拆解、02 输入输出定义、03 RAG 设计、03 工具编排、04 数据处理。
-
-目标：从关键词命中升级为可解释的结构化代码关系分析。
-
-计划：
-
-- Java Controller/Service/Feign/Mapper/Entity 结构索引。
-- Vue 路由、组件、API、表单字段、权限索引。
-- 前端 -> 网关 -> 服务 -> 数据库调用链。
-- 方法级引用关系和跨项目依赖。
-- `PROJECT_INDEX` 作为已有业务链路知识的输入。
-- 需求关键词、接口路径、领域对象的多路召回。
-- 文件、符号、行号和 commit 的稳定证据。
-- 调用链 Mermaid 图。
-
-验收标准：
-
-- 对护照 OCR 示例能识别商户端、国际站、customer-core、admin-core、运营后台之间的链路。
-- 能区分直接影响、间接影响和潜在回归影响。
-- 对“未找到”与“证据不足”保持不同状态。
-
-### Phase 3：DSH 多 Agent 语义分析
-
-状态：**待开发**
-
-对应 FDE 能力点：02 人机协同、02 异常分支、02 闭环设计、03 模型选型、03 Agent 边界、03 Prompt 策略、03 工具编排、06 幻觉控制。
-
-计划 Agent：
-
-1. 需求分析 Agent：拆分规则、角色、输入输出、验收标准。
-2. 项目侦察 Agent：确认项目、分支、commit 和扫描范围。
-3. 代码定位 Agent：定位入口、服务、数据和已有测试。
-4. 调用链 Agent：解释跨文件、跨项目调用关系。
-5. 实现审查 Agent：逐条对比需求与实现。
-6. 测试设计 Agent：生成可执行测试场景和测试数据。
-7. 质量裁决 Agent：根据证据归因并给出风险等级。
-8. 报告 Agent：生成面向研发、测试和产品的不同视图。
-
-实施要求：
-
-- Agent 输出必须经过 Pydantic 校验。
-- 每条结论必须绑定证据引用。
-- Agent 失败时保留确定性分析结果。
-- Windows 原生环境默认不启动不可用 Runtime；优先支持 WSL2/Linux。
-
-### Phase 4：测试执行引擎
-
-状态：**待开发**
-
-对应 FDE 能力点：02 异常分支、02 闭环设计、04 API 集成、04 自动化工作流、04 服务化部署、06 日志监控。
-
-计划支持：
-
-- Maven/Gradle 单元测试。
-- pytest。
-- npm/pnpm lint、build、test。
-- API 测试：HTTPX/pytest。
-- 数据库查询和数据一致性校验。
-- Playwright 页面验证。
-- 测试日志、退出码、耗时和环境信息采集。
-- 测试失败、环境失败、数据阻塞的自动归因。
-
-安全要求：
-
-- 命令白名单或显式任务配置。
-- workspace 和测试数据隔离。
-- 默认禁止生产环境连接。
-- 不执行 git push、reset --hard 或未授权删除。
-- 所有命令保存审计记录。
-
-### Phase 5：可视化前端
-
-状态：**待开发**
-
-对应 FDE 能力点：04 原型开发、04 服务化部署、06 日志监控、07 用户培训、07 试点推进。
-
-建议技术：React + TypeScript + Vite + Ant Design + ECharts + Mermaid。
-
-页面：
-
-- Dashboard：任务数、风险数、通过率、趋势。
-- 新建分析：需求文件、项目、分支和测试选项。
-- 任务进度：阶段、Agent、日志和耗时。
-- 报告总览：结论、风险、覆盖率和阻塞项。
-- 需求实现矩阵：需求项对应代码、测试、证据。
-- 影响范围：项目、模块、接口、数据表和调用链。
-- 测试中心：用例、执行状态、日志和重跑。
-- 证据查看：源码路径、行号、命令输出、截图和响应。
-
-验收标准：
-
-- 可以上传需求文档并创建分析任务。
-- 可以查看分析进度和生成的报告。
-- 可以点击需求项跳转到影响范围、证据和测试用例。
-- 可以直接打开或下载 HTML/JSON/Markdown 报告。
-
-### Phase 6：历史库与研发流程集成
-
-状态：**规划中**
-
-对应 FDE 能力点：01 角色访谈、01 痛点排序、01 ROI 假设、05 CRM 集成、05 ERP 集成、05 工单系统集成、05 企业 IM 集成、05 权限体系集成、06 Eval 设计、06 准确率评估、06 人工复核、07 数据追踪、07 反馈闭环、07 经验产品化。
-
-计划：
-
-- 使用本地 MySQL `ai-navigator` 保存任务、需求、证据、测试和结论（约定见 [`DATABASE.md`](./DATABASE.md)）。
-- 报告版本和需求版本对比。
-- 代码 commit/分支快照对比。
-- 复用 `PROJECT_INDEX` 和历史分析结果。
-- GitLab Merge Request 自动分析。
-- CI 质量门禁。
-- 高风险变化通知。
-- 回归测试推荐。
-- 需求到上线的质量趋势。
-
----
-
-## 4. MVP 数据对象
-
-当前模型位于 `backend/app/models/schemas.py`。
+模型位于 `backend/app/models/schemas.py`：
 
 ```text
 RequirementItem
@@ -374,17 +242,8 @@ RequirementItem
 核心状态：
 
 ```text
-ImplementationStatus:
-- implemented
-- partially_implemented
-- not_found
-- uncertain
-
-Verdict:
-- pass
-- fail
-- blocked
-- needs_review
+ImplementationStatus: implemented / partially_implemented / not_found / uncertain
+Verdict: pass / fail / blocked / needs_review
 ```
 
 约束：
@@ -393,74 +252,18 @@ Verdict:
 - `blocked` 只用于环境、依赖、权限或测试数据导致无法执行。
 - `fail` 必须有可复验的代码或测试证据。
 
----
-
-## 5. 当前待办清单
-
-### 近期优先级 P0
-
-- [ ] 修正报告 HTML：使用真正的表格、徽章、折叠区和风险颜色，而不是转义 Markdown 文本。
-- [ ] 增加接口测试：上传需求文件并通过 `/api/analyze` 生成报告。
-- [ ] 将 `PROJECT_INDEX` 详情文件作为影响分析的优先知识来源。
-- [ ] 增加 Java/Vue 结构化索引，降低关键词误报。
-- [ ] 增加测试命令执行器，但先采用白名单和 dry-run。
-
-### 中期优先级 P1
-
-- [ ] 完成 DSH Agent prompt、Skill 加载和结构化输出校验。
-- [ ] 接入真实测试结果和日志证据。
-- [ ] 生成 Mermaid 调用链。
-- [ ] 支持报告按需求项、项目和风险筛选。
-- [ ] 接入 React 前端。
-
-### 后续优先级 P2
-
-- [ ] SQLite 历史分析库。
-- [ ] GitLab MR/CI 集成。
-- [ ] 变更影响分析。
-- [ ] 自动推荐回归测试。
-- [ ] 质量趋势、团队和项目看板。
+M2 起流水线各阶段结果直接落库（见 §0.2 表）；规则分析报告仍写文件（`reports/`）。表清单与状态见 [`DATABASE.md`](./DATABASE.md)。
 
 ---
 
-## 6. 当前示例：护照 OCR 链路
+## 6. 验收样板（真实需求）
 
-示例需求：`requirements/passport-ocr-demo.md`
+| 样板 | 需求 | 状态 |
+|---|---|---|
+| 护照 OCR 链路 | `requirements/passport-ocr-demo.md`（商户端→international-core→customer-core→admin-core→运营后台） | Phase 1 验收通过；M5 用于跨项目链路验收 |
+| customer 登录逻辑 | `scripts/req_customer_login.md`（LoginServiceImpl.checkPwd 五种登录方式、错误锁定、风险关注点） | M2 流水线实测完成（task-c0a8418fff04） |
 
-涉及项目：
-
-- `member-exchange-client`
-- `baofu-international-core`
-- `baofu-customer-core`
-- `baofu-admin-control-core`
-- `baofu-admin-control-client-vue`
-
-已有业务索引：
-
-```text
-C:\Akua\PROJECT_INDEX\account-holder-other-area-passport.md
-```
-
-重点验证链路：
-
-```text
-商户端上传护照
-  -> /api/custom-holder/addPersonalOtherArea
-  -> baofu-international-core
-  -> PassportOcrBiz
-  -> CustomerOcrFacade
-  -> T_CUSTOMER_OCR
-  -> 运营后台 queryMrzByCustomerNo
-  -> MRZ 展示/编辑
-  -> updateMrz
-```
-
-该示例后续优先用于验收：
-
-1. 能否正确识别已实现的 OCR 保存和 MRZ 展示功能。
-2. 能否识别商户端 OCR 失败处理和重复数据风险。
-3. 能否区分运营后台展示问题与商户端上传接线问题。
-4. 能否生成跨项目调用链和回归范围。
+新能力优先用这两个样板做端到端验收。
 
 ---
 
@@ -472,34 +275,27 @@ C:\Akua\PROJECT_INDEX\account-holder-other-area-passport.md
 - 新增能力有至少一个自动化验证或可重复命令。
 - 报告或 API 输出可被检查。
 - 失败和阻塞原因已记录。
-- 本文档同步更新状态、结果和下一步。
+- `PLAN.md` / `CHANGELOG.md` 同步更新状态与下一步。
 - 没有执行违反工作区规则的 git 上传或危险操作。
-
-每次迭代记录建议追加到：
-
-```text
-plansea/CHANGELOG.md
-```
 
 ---
 
 ## 8. 当前运行命令
 
 ```powershell
+# 一键启动（推荐）：双击 start.bat，或
+cd C:\Akua\ai-test-navigator\scripts; powershell -File ..\start.ps1
+
+# 手动启动 FastAPI（:8090）
 cd C:\Akua\ai-test-navigator
-python -m pip install -r requirements.txt
-$env:PYTHONPATH = "$PWD\backend"
-python -m app.cli `
-  --requirement requirements\passport-ocr-demo.md `
-  --projects baofu-customer-core baofu-international-core baofu-admin-control-core baofu-admin-control-client-vue member-exchange-client `
-  --workspace C:\Akua `
-  --branch integration `
-  --output reports
-```
-
-FastAPI：
-
-```powershell
 $env:PYTHONPATH = "$PWD\backend"
 uvicorn app.main:app --host 127.0.0.1 --port 8090
+
+# 前端构建（React + esbuild）
+cd frontend; node ../scripts/build-frontend.mjs
+
+# 冒烟验证
+python scripts/smoke-db.py       # DB 建表 + CRUD + SQLite 降级
+python scripts/smoke-dsh.py      # DSH Runtime 满血组合
+python scripts/smoke-e2e.py 8090 # 端到端：创建任务→8-Agent→入库→dashboard
 ```

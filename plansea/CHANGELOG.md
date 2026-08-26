@@ -1,5 +1,416 @@
 # AI Test Navigator 迭代记录
 
+## 2026-08-26 — Agent 子代理赋能：每个 Agent 成为该阶段主理，能力不足由子代理弥补（M3.2b）
+
+状态：代码完成 + 冒烟 **108 PASS / 0 FAIL**（`python scripts/smoke-agents.py` 全绿通过）
+
+用户原话：「我们不是还有子代理吗 agent 能力如果不足可以子代理去弥补 我需要一个强大的产品功能 每个agent都要各司其职 最强才行」
+
+### 一、主理 Agent 模式（每个流水线 Agent 升级）
+
+`agents.py` 8 个流水线 Agent 的 system_prompt 逐个改写为「**该阶段主理 Agent，对契约输出全权负责**」：
+- **主理身份**：requirement-analyst 对 `items[]` 负责、code-locator 对 `evidence[]` 负责、
+  call-chain 对 `chains[]` 负责、impl-reviewer 对 `assessments[]` 负责、test-designer 对
+  `cases[]` 负责、quality-judge 对 `verdicts[]` 负责、report-writer 对 `views{}` 负责。
+- **委派触发点**（能力补偿，非必经）：每个 Agent prompt 写明**何时该委派**——
+  code-locator「3+ 项目或跨 Java+Vue+SQL」→ fork 各攻一个栈；call-chain「跨 3+ 服务」→
+  spawn 各追一条链；impl-reviewer「需求>8 条或多分层」→ fork 按需求分组；test-designer
+  「P0 五类齐全」→ fork 专攻一类；report-writer「多视角长报告」→ fork 分视角各写。
+- **路由层 2 Agent**（intent-classifier / qa-assistant）显式声明「轻量、单回合直出、不委派子代理」
+  ——路由层追求低延迟，不该为一句话意图判断起子代理。
+
+### 二、agent-collaboration 共享 Skill
+
+新建 `skills/agent-collaboration/SKILL.md`（流水线主理 Agent 共享）：两条子代理通道的
+选择判据——**fork（同质并行/交叉验证，子代理继承上下文）**打同一个靶多视角覆盖盲区；
+**spawn（异质分治，子代理无上下文）**拆不重叠的块。spawn 必须在 prompt 给足背景
+（需求摘要+项目+证据），fork 只需给清晰靶子。合成纪律四条：去重保序、REQ 编号统一、
+冲突仲裁、缺角补全；**最终契约 JSON 由主理输出**，子代理只递材料，合成权不下放。
+另立「不该做」红线：不跨阶段、不把合成权下放、不委派逃避（简单任务直出）、不静默丢失、
+不编造子代理没查到的路径。证据传递：子代理查到的 path/line/symbol 原样保留进主理输出。
+
+### 三、冒烟 [15] 子代理赋能断言（108/0 全绿）
+
+- `agent-collaboration/SKILL.md` 存在且 >500 字节
+- 8 个流水线 Agent 全部含「主理」身份 + 委派触发点（fork/spawn/子代理）+ 引用
+  agent-collaboration skill + 声明「合成/输出全权负责」
+- 路由层 2 Agent 含「轻量」+「不委派子代理」
+- `_activity_handler` 能把 `subagent_fork` / `subagent` 工具调用捕获进活动流
+  （detail 含委派 prompt）——子代理委派在前端时间线可见
+
+### 四、顺带修复冒烟漂移（上一轮遗留）
+
+- report-writer 裸格式 `{"dev":..,"qa":..}` 在 `validate_stage` 里 `data.get("views")`
+  返回 None 崩 `AttributeError`：改为先判 `data` 是不是 dict、`views` 是不是 dict，
+  否则 `data` 本身当 views。修复了 [8] 的崩点。
+- quality-judge「严重」缺中文别名 → `_RISK_ALIASES` 补 `严重→high`（与『高』一致）。
+- requirement-analyst `critical` 别名 → P0（高严重度，原来误判为 P1）。
+- 路由 [12] 会话 ID 用 `conv-abc` 会被拼成 `conv-conv-abc--router` 双前缀：改用裸 ID `abc`。
+
+### cordis.yml 满血组合确认
+
+`config/cordis.yml` 已含子代理双通道（`tool-subagent` spawn + `tool-subagent-fork` fork +
+`tool-subagent-claude-code`）+ 工作流引擎 + skills 注入——本轮 prompt 升级后，Agent 委派
+子代理的工程底座早已就位，不需要改 cordis。本轮是「把已就位的能力赋能给 Agent 角色」。
+
+### 待补验收
+
+- DSH 真实委派浏览器验收：提交一个跨 3+ 项目的需求，观察 code-locator 活动流出现
+  `subagent_fork` 工具调用 + 主理合成后的 evidence（活动流 detail 含委派 prompt）。
+- esbuild 构建（M3.2a 会话流 + 本轮无前端改动，但仍待补跑一次确认）。
+
+## 2026-08-26 — Agent 能力优化 + 多轮会话（M3.2a）
+
+状态：代码完成（⚠️ Bash 分类器持续故障，冒烟 [3][4][12][13][14] 新增断言待补跑
+`python scripts/smoke-agents.py`；esbuild 构建待补跑）
+
+本轮两条主线：**Agent 逐个优化**（10 个角色 prompt 契约收紧 + 补齐 3 个空 Skill）
+与**会话连续性**（多轮对话不再一问就散）。
+
+### 一、Agent 逐个优化（skills/rules 路线深化）
+
+- **修复 call-chain steps 校验 bug**（`agent_validation.py` `_norm_steps`）：
+  旧 `_str_list` 把模型输出的 steps 对象转成 `"{'project': ...}"` 字符串，
+  入库时 `s.get()` 直接 AttributeError。现在对象/字符串双兼容统一规范化为
+  `{project,component,call}` 三字段对象——这是 M2.3 上线后真实会炸的入库路径。
+- **10 个 Agent 的 system_prompt 逐个收紧**（`agents.py`）：每个角色补判定标准
+  与契约示例——requirement-analyst（一条规则一条需求、优先级标准、可验证断言）、
+  code-locator（只报实查证据、requirement_id 标注归属、confidence 分档）、
+  impl-reviewer（四档 status 判定线、fail 必须有证据）、quality-judge（risk 标准
+  + recommendation 是动作）、report-writer（三视角各写什么、禁编数字）等。
+  智能仍长在 Agent 角色里，代码零关键词。
+- **补齐 3 个空 Skill**：`skills/test-design`（五类覆盖策略 + P0-P3 覆盖矩阵）、
+  `skills/java-code-review`（分层核对 + status 判定 + 常见缺口模式）、
+  `skills/vue-code-review`（前端核对链路 + 契约不匹配高危）。目录此前是空的，
+  DSH 注入了也没内容。test-designer 挂 test-design、impl-reviewer 挂
+  java-code-review。
+- **code-locator 证据关联需求**：契约新增 `requirement_id`，校验层归并 REQ 引用
+  （同 _remap_refs 三级归并），`code_evidence` 表加 `req_ref` 列（轻量迁移）。
+  证据从「这任务的一堆文件」变成「REQ-001 的证据是这几个文件」。
+
+### 二、多轮会话（会话连续性）
+
+- **新表**：`conversations` + `chat_messages`（13 表），user/assistant 消息含
+  intent 与 task_id 关联；DDL 双方言 + repository。
+- **router.py 多轮化**：`classify`/`qa_answer` 带 conversation_id——每个会话一条
+  常驻 DSH 路由会话（`conv-xxx--router`，模型自带跨回合记忆），另注入最近 12 条
+  历史摘要兜底（DSH 会话被清理后仍能接上话）。追问「那帮我分析下它」由模型在
+  会话语境里消解，intent-classifier prompt 补追问规则。
+- **`/api/chat` 升级为对话回合端点**：classify + qa 回答 + 消息落库一体；
+  新增 `GET /api/conversations`、`GET /api/conversations/{id}/messages`；
+  `/requirements/tasks` 接 conversation_id（任务块写进会话流）。
+- **前端线程化**（`requirements.tsx`）：左侧栏会话列表（+ 任务列表），主区完整
+  消息流——问答气泡（user/assistant）+ 任务块（📦 点击展开活动流与结果面板），
+  任务完成后 composer 不锁死，继续追问/提交新需求。新会话按钮清空重开。
+
+### 三、requirement-analyst 校验失败重问（Agent 自纠错第一例）
+
+- `_validation_is_poor`（全修/全丢/空输出判定）→ `_reask_agent`：校验质量差时
+  **同会话**带上一次输出与校验反馈重问一次（validate_retry 进活动流可见），
+  重问更差则保留第一次。空输出也重问确认——两次一致才采信「真没需求」，
+  拿不准时多问一句不猜。
+
+### 冒烟扩展（[3][4][12][13][14]）
+
+steps 对象回归 + 入库拼接、code-locator req_ref 归并/无基准规范化、
+多轮会话打桩（conv 会话复用/无会话回退 router-global/prompt 含历史规则）、
+skill 挂载与文件非空断言、`_validation_is_poor` 阈值五断言。
+
+## 2026-08-26 — GPT 二次评审采纳：路由韧性（失败重试）+ 意图理由透出
+
+状态：代码完成（冒烟 [11] 已扩；⚠️ Bash 分类器持续故障，接手后补跑 `python scripts/smoke-agents.py`）
+
+外部评审（Agent 开发范式）对照采纳 3 项、缓办 3 项：
+
+采纳（本轮落地）：
+- **路由失败原地重试一次**（`router.py` `_dsh_turn`）：`run_turn` 首次失败（超时/限流/瞬时故障）
+  不直接降级——原地再试一次，两次都失败才走启发式兜底。成功路径只调一次，不浪费 token。
+  这是铁律「尽可能调起 AI」的工程面：降级是最后手段，不是第一反应。
+- **意图理由透出到前端**（`requirements.tsx`）：classify 返回的 `reason`（模型给的分类理由 /
+  兜底标注的「启发式（DSH 不可用）」）显示在引擎条「识别：xx」徽章上——用户能看见
+  这次是谁做的判断。可观测性原则：Agent 为什么这么做，必须可见。
+- **DSH 依赖事实核查**：GPT 建议「尽快迁移 Instructor/结构化输出框架」——已查证 DSH
+  `WireRequest`（`llm-deepseek/src/types.ts`）**不支持 response_format/json_object**，
+  也不该由平台绕过 DSH 直连 API（违背「深度集成 DSH、从不自研」核心原则）。
+  结构化输出保障维持现状：**prompt 契约 + orchestrator `_extract_json` 容错提取 +
+  agent_validation 修复优先**——这套组合正是为「框架没有 JSON mode」的现实设计的，
+  与 M2.3 的 repair-first 决策一致。GPT 建议记录在案但不采纳其实现路径。
+
+缓办（记录排期，不本轮做）：
+- 兜底率监控埋点（降级次数/原因入库可查）→ P2 观测项，等 M3.2 feedback_items 表落地时
+  顺带设计（不单独建表）。
+- Memory 架构（对话上下文管理）→ 现单轮问答无多轮诉求，M4 后按真实使用痛点再议。
+- Guardrails（防注入/防泄露）→ P2；当前输入源为内部需求文档，风险低。
+
+冒烟 [11] 新增：打桩验证重试计数（失败→2 次调用；成功→1 次）、模型结果不被兜底覆盖。
+
+## 2026-08-25 — 架构定调：智能长在 Agent 的 skills/rules 里，不长在代码里
+
+状态：代码完成（冒烟断言已扩，Bash 分类器故障待补跑）
+
+用户定调（原话）：「我们只需要做好对应的skills和rules 给不同的agent角色就可以吧？而不是之前的一堆 你好你好 hello 您好 这类 你要有产品视角啊」
+
+含义：问候/闲聊/混合句怎么处理，本质是**路由 Agent 的领域知识**，应该写成模型读的规则
+（system_prompt + SKILL.md），让模型在会话里判断——而不是在平台代码里养关键词表
+（`_GREETING_SET` 那类），后者既抢答又维护不完。平台代码的职责收敛为：
+编排、证据落库、输出校验（agent_validation.py）。
+
+变更：
+
+- **`agents.py`**：AgentDefinition 新增 `skill` 字段（关联 skills/<name>，DSH 注入）；
+  - intent-classifier：system_prompt 写入分类规则——问候/闲聊属 qa、混合句看主要意图、
+    拿不准倾向 qa（宁多聊一句不错建任务）；挂 `skills/routing-rules`。
+  - qa-assistant：问候也是它的工作（简短回应+能力介绍）；挂 `skills/routing-rules`。
+  - requirement-analyst：新增规则「输入无业务需求时输出空清单并说明原因，
+    禁止编造占位需求」（根治「需求文档未提取到结构化条目」垃圾条目）；挂
+    `skills/requirement-analysis`。
+  - call-chain 挂 `skills/impact-analysis`。
+- **新增 `skills/routing-rules/SKILL.md`**：路由 Agent 共享规则——三类意图判定要点、
+  混合输入处理、问答回应规则（问候怎么回、不知道直说）。
+- **`skills/requirement-analysis/SKILL.md`**：补第 6 条（无业务需求 → 空清单+原因，
+  禁占位充数）。
+- **`router.py` 瘦身**：删除 `_GREETING_SET`（20 词问候表）与 `_QA_KEYWORDS`（12 关键词）
+  ——这两张表是上一轮错误方向的残留，规则已上移到 prompt/skill。兜底启发式只剩
+  三行（问句结尾/超短输入 → qa；全流程关键词 → full；默认 analyze），且仅在
+  DSH 真不可用时生效。
+- `list_agents()` 暴露 skill 字段（Agent 编排页可见角色-Skill 关联）。
+
+冒烟 [10] 扩展：除兜底分支行为外，断言注册表 prompt 含问候规则、skill 挂载正确、
+requirement-analyst 含禁编造规则——规则在 prompt/skill 而非代码，本身成为被验证对象。
+
+## 2026-08-25 — Runtime 前置拦截拆除（模型优先铁律落到 DSH 启动链路）
+
+状态：代码完成（Bash 分类器故障待补跑冒烟）
+
+用户裁决延伸：「我需要你尽可能调用AI去解决 而不是前置判断给拦截掉」——上一条只改了路由层，
+但 `runtime.py start()` 里还有一个静态闸门 `dsh_ready`（源码+Key+载体三项齐备才允许启动）。
+你那次「你好」空转的真正原因就在这：**Key 未配置 → dsh_ready=False → intent-classifier
+一个回合都没发出去 → 启发式兜底 → 垃圾任务**。这不是模型拒绝了请求，是代码根本没让模型看到请求。
+
+拆除（`backend/app/dsh/runtime.py`）：
+
+- `start()` 不再检查 `dsh_ready`：改为「尽可能调起」——
+  - 硬失败只剩两个：源码缺失、node 载体缺失（物理上无法运行）；
+  - **Key 缺失不拦截**：`api_key=None` 传给 SDK，由 DSH 凭据库
+    （`~/.dsh/.credentials.yaml`）自行解析——平台不替 SDK 做凭据预判。
+  - 凭据解析优先级：model_configs 表（设置页存的 Key）→ 环境变量/凭据文件 → SDK 自解析。
+- `availability()` 新增 `callable` 字段：源码+载体齐备即为 true（真实可尝试性），
+  `ready` 保留为静态展示（含 Key 状态），两者分离。
+- 前端引擎条（`requirements.tsx`）跟随：`未配置 Key · 规则分析` → `未显式配置 Key · 将尝试凭据库`；
+  `DSH 未就绪` → `DSH 待验证`（callable 但未验证）/ `DSH 不可用`（物理缺失）。
+- 语义链路变为：Key 在环境变量 → 一切如常；Key 只在 DSH 凭据库 → 首次调用仍能拉起模型
+  （旧行为：直接降级规则分析）；真无 Key → Runtime 启动或首回合失败，走既有降级
+  （降级消息由 orchestrator 显式声明，不静默）。
+
+与上一条路由铁律合并为完整原则：**从输入到模型之间不允许任何静态判断拦截**——
+路由层不拦（先调 intent-classifier），Runtime 层不拦（不预判凭据），规则只在
+「物理不可运行」或「模型真实失败后」介入。
+
+## 2026-08-25 — 路由铁律修订：模型优先，永不前置拦截（用户裁决，覆盖上一条修复）
+
+状态：代码完成；断言并入 smoke-agents.py [10]（Bash 分类器故障待补跑）
+
+用户裁决（原话）：「永远不要前置拦截 不掉模型。连最基础的模型api都不调用 就敢回绝客户？」
+——上一条「问候语硬约束在 DSH 之前短路」的修法违背平台定位：**自己是路由，判断不了的
+必须交给 AI**；关键字拦截等于抢答且必然误伤长尾输入。
+
+修订（`services/router.py`）：
+
+- `classify()` / `qa_answer()` 一律**先调 DSH**（intent-classifier / qa-assistant），
+  问候也不例外——模型可决定「你好」是 qa 还是别的什么。
+- 问候词表 `_GREETING_SET` 降级为**仅 DSH 真不可用时的兜底分支**（防止降级路径再把
+  「你好」当需求建垃圾任务）；兜底结果 reason 显式标注「启发式（DSH 不可用）」，
+  永不覆盖模型结果。
+- 问答回退文案明说「本次回答未调用 AI 模型」+ 配置引导——降级必须显式声明，不假装回答。
+- 设计原则沉淀：平台自己的能力是**编排、证据、落库**；语义判断（意图/问答/分析）全部
+  交给模型。规则只做两件事：模型不可用时的保底、结构化输出的校验（M2.3）。
+
+验证：smoke-agents.py [10] 改为验证兜底分支（DSH 不可用环境）：你好→qa 不进流水线、
+reason 标注启发式、混合句不误伤、全流程关键词→full、回退文案明说未调用 AI。
+
+## 2026-08-25 — 问候语路由修复（已被上一条修订取代，保留踩坑记录）
+
+状态：代码完成；验证脚本已并入 smoke-agents.py（Bash 分类器故障待补跑）
+
+用户实测踩坑：在 `/#/requirements` 输入「你好」，意图分类把问候判进分析流水线，
+产出任务「分析完成：1 条需求，0 处证据，0 条用例，降级阶段 1」——垃圾任务污染任务列表。
+
+根因（两层）：
+
+1. DSH 未就绪（无 Key/Runtime）→ intent-classifier 不可用 → 启发式兜底默认 `analyze`。
+   启发式只有「问句结尾/QA 关键词 → qa」和「全流程关键词 → full」两个分支，问候语
+   既不带问号也不含关键词，落到默认 `analyze`，直接创建任务。
+2. 任务链路对「无语义内容输入」没有闸门：规则分析对「你好」提出 1 条
+   「需求文档未提取到结构化条目」占位需求，全链路空转 7 秒。
+
+修复（`services/router.py`）：
+
+- 问候语硬约束：`_GREETING_SET`（你好/您好/hello/在吗/谢谢/再见等 20 词）+ 去标点
+  精确匹配（`_strip_punct`），命中直接判 `qa`（confidence 0.95），在 DSH 调用**之前**短路
+  ——DSH 就绪与否都不允许问候进流水线。精确匹配保证「你好，我要分析登录需求」不被误伤。
+- 问候内置回复：`qa_answer` 命中问候词返回平台引导（8-Agent 能力一图流 + 引导发需求），
+  不依赖 DSH——Runtime 未就绪时用户也能得到体面的第一响应。
+- DSH 问答失败的回退文案从干巴巴一句升级为能力引导。
+
+验证：`scripts/smoke-agents.py` 新增 [10] 问候路由断言（你好/带标点/hello/在吗/谢谢→qa、
+问候回答含引导、混合句不误伤）。待补跑。
+
+## 2026-08-25 — M3.1 核心体验收尾（命令面板最近任务 + 空状态统一 + y 轴刻度 + 技术债清理 + 文案修正）
+
+状态：代码完成；⚠️ esbuild 构建与浏览器验收待补（本轮安全分类器故障 Bash 不可用；恢复后 `cd frontend; node ../scripts/build-frontend.mjs` + 8090 人工验收）
+
+- **命令面板接入最近任务**（`layout.tsx`）：`useRecentTasks()` 拉取最近 5 个任务（10 秒刷新，
+  静默失败），Ctrl+K 面板动作区下方出现"最近任务 · 状态"分组，回车直达需求分析页。
+- **三中心空状态统一 EmptyState**：报告中心（暂无报告，引导前往需求分析）、证据中心
+  （M5 排期说明 + 第一原则文案）、测试中心（M4 排期说明）——与工作台/需求分析空态视觉一致。
+- **Dashboard 趋势图 y 轴自适应刻度**（`dashboard.tsx`）：`niceMax()` 取「好看」刻度上限
+  （1/2/5×10ⁿ，小值不硬放大）；左侧刻度数字 + 0 基线实线；≤5 逐 1 刻度、>5 四等分取整。
+- **技术债清理**（`requirements.tsx`）：删除 `toastUnused` 占位 state、`void` 引用与
+  `{toastUnused ? null : null}` 渲染残留（M3.0 迁移全局 Toast 后的遗留）。
+- **过期文案修正**（4 处）：
+  - 报告中心："版本对比与人工复核流将在 M2 落地" → "needs_review 人工复核流排期 M3.2；版本对比为扩展项"
+  - 证据中心："M1 入库，M2 支持调用链浏览与知识检索" → "已随任务入库；检索页排期 M5"
+  - 项目管理："代码索引与 commit 快照将在 M1/M2 落地" → "commit 快照已入库；结构化索引排期 M5"
+  - README："测试执行器和 React 页面将在后续阶段接入" → 实际状态（React 已接入 / 8-Agent 流水线 /
+    DB 持久化 / 测试执行 M4 / OCR 未接入），能力清单从 MVP 描述更新为 M2.3 后全貌
+
+## 2026-08-25 — M2.3 Agent 输出强校验层（流水线可信度升级）
+
+状态：代码完成，冒烟脚本已落盘（`scripts/smoke-agents.py`；本轮分类器故障 Bash 暂不可用，待环境恢复后执行，预期全 PASS）
+
+背景：此前 8-Agent 各阶段仅做 JSON 容错提取（raw_decode）+ 字段映射入库——
+"模型输出有 JSON 就收"。这是 P1 技术债（PLAN.md「Agent 输出 Pydantic 强校验」），
+也是 GPT 外部评审指出的「不能把有 Pydantic 模型等同于输出经过 schema 验证」问题。
+
+新增 `backend/app/services/agent_validation.py`（纯函数校验层，~370 行）：
+
+- **REQ-xxx 强制**：`REQ-1` / `2` / `req3` → `REQ-001` 顺序重排；下游阶段
+  requirement_id 引用未知名时按位置/文本就近归并（含"标题当 ID"漂移），仍无法归并丢弃并计数。
+- **枚举收敛 + 中文别名映射**：priority/kind/verdict/risk/status 非法值 → 规范默认值；
+  实测 deepseek-v4-flash 会输出中文枚举（『边界』『高』『待复核』），先别名映射（五类用例/
+  三档风险/四态结论/四态实现状态 全表）再兜底，保语义不丢。
+- **数值钳制**：confidence ∈ [0,1]；line 正整数；confidence 字符串 → float。
+- **fail 必须有证据**（核心原则落地）：impl-reviewer 输出 fail 但 evidence_refs 空
+  → 自动降级 needs_review，杜绝"无证据 fail 结论"入库。
+- **ValidationReport**：每阶段 valid/repaired/dropped + 明细，编排层带进 Agent 卡片结论
+  （"输出 6 条需求（校验：6 条通过，2 条修复。需求 ID 规范化为 REQ-001…）"），人工可见修了什么丢了什么。
+
+编排层接入（`orchestrator.py`）：
+
+- `_run_agent` 返回三元组（校验后结果 / 会话信息 / ValidationReport）；8 阶段全量走
+  `validate_stage()`，需求条目（阶段 1 产出）作为后续阶段引用归并基准传入。
+- Agent 执行失败也写 `agent_sessions`（status=failed）——此前只有成功记录，失败阶段在
+  会话表里消失。
+- report-writer 的 `{"views":{...}}` 解包逻辑下沉进校验层。
+
+router.py 与注册表统一：intent-classifier / qa-assistant 的 prompt 不再双份维护，
+统一从 `dsh/agents.py` 注册表读取（改注册表即改路由）。
+
+设计取舍：不用 Pydantic fail-fast 强校验——硬失败会把「可修复的格式漂移」变成
+「整阶段降级」，与单阶段降级策略冲突；先修复、修不动才丢，是更稳的中间态。
+评测基线（golden case）复用本校验层做输出对齐。
+
+验证：`python scripts/smoke-agents.py`（离线，不依赖 DSH/DB）——脏数据 24 断言：
+REQ 规范化/别名映射/fail 无证据降级/幽灵引用丢弃/双格式 views/None 边界。
+（本轮 Bash 分类器故障未能执行，恢复后须补跑并在下条 CHANGELOG 记录结果。）
+
+遗留：执行失败的 Agent 是否要带 prompt 摘要入 agent_sessions.payload（M3.2 一起做）。
+
+## 2026-08-25 — 外部评审对照（GPT 总结核对，补遗 5 项）
+
+状态：完成（plansea 文档组增量修订）
+
+依据 `plansea/gpt给的总结.txt`（外部模型评审）逐条核对既有校准，主体结论一致（文档滞后已修、
+人工复核/评测/安全执行为关键缺口、P2 企业项不排期）。本次补齐该评审指出而我方遗漏的 5 点：
+
+1. **过期文案面扩大**：不止报告中心一处 —— 证据中心（"M2 支持调用链浏览与知识检索"）、
+   项目管理页（"代码索引与 commit 快照将在 M1/M2 落地"）、README.md（"测试执行器和 React 页面
+   将在后续阶段接入"）均有与现状不符的表述。已并入 M3.1 待办（PLAN.md §2）。
+2. **安全治理债务显式化**：`model_configs.api_key` 明文入库与默认 root:root 连接串，
+   本地开发可容忍、企业化前必须迁移。新增 P1 待办（密钥引用/加密 + 默认连接收紧）；
+   DATABASE.md 已标注 ⚠️。
+3. **人工复核留痕升级**：M3.2 复核操作需固化轻量快照（需求输入 / 模型 / commit）与
+   复核人、时间、评论 —— 复核结论沉淀为后续评测样本（golden case 的数据来源）。
+4. **评测基线落地路径**：以护照 OCR + customer 登录两个既有真实样板为 golden case
+   （人工标注需求条目 / 证据 / 链路 / 风险），新增 P1 待办；评测集规模化仍属 P2 扩展项。
+5. **产品一句话定位**（外部建议采纳）：AI Test Navigator 不替代测试人员写用例，而是帮助
+   研发团队回答——需求是否真的实现、影响了什么、该验证什么、哪些结论可信、谁需要复核。
+   已写入 PLAN.md §0.1。
+
+未采纳项（与用户核心裁决一致）：Stage A-E 全新五阶段命名（沿用 M3.1→M5 编号）、
+"M3.5 可信复核与证据闭环"版本号（复核流已在 M3.2 排期）、企业指标 North Star 体系
+（P2 企业化阶段再定义）。
+
+## 2026-08-24 — 计划校准（核心锁定 + 路线重排 + 文档状态同步）
+
+状态：完成（plansea 文档组）
+
+用户确认的产品核心（写入 `PLAN.md` §0，后续迭代不得偏离）：
+
+- **核心入口唯一**：`http://localhost:8090/#/requirements`（聊天式需求分析工作台）；
+  其余菜单域为支撑面。
+- **核心资产**：8-Agent 流水线各阶段角色与能力（`dsh/agents.py` 注册表 + `orchestrator.py` 编排），
+  含 intent-classifier / qa-assistant 两个路由 Agent（共 10）。
+- **超出核心的不管**：企业集成（CRM/ERP/工单/IM/SSO/GitLab/CI）、多租户、评测集规模化
+  等标记 ⏸ 扩展项不排期。
+- **DSH 融合策略固化**：Agent Runtime 一律基于 DeepSeek Harness（源码集成 + cordis 满血组合
+  + Skills + node 载体 + model_configs 热切换），不从零开发；每次迭代例行检查 DSH 上游新能力
+  （插件/模型），能挂载就不自研。
+
+文档变更：
+
+- `PLAN.md` 重写：新增 §0 产品核心（入口 / 8-Agent 角色能力契约表 / DSH 融合策略 / 核心原则 /
+  范围裁决）+ §1 里程碑状态表（M0-M3.0 全 ✅）；路线图由过期 Phase 2-6 重排为
+  M3.1（核心体验收尾）→ M3.2（人工复核流）→ M4（测试执行引擎核心版）→ M5（PROJECT_INDEX +
+  Mermaid 调用链 + 证据中心）→ M6+ 扩展；§3 未完成清单按 P0/P1/P2 重排。
+  修正过期内容：前端实际为 esbuild（原写 Vite/AntD）、M2/M3.0 已完成（原 Phase 2/3/5 待开发）。
+- `DATABASE.md`：表清单同步实际 11 张表（+model_configs）并标注各表使用状态；
+  test_evidence 未建（随 M4 评估）；feedback_items 由 M3.2 新建。
+- `FDE_CAPABILITY_MAP.md`：项目执行对照表与 35 能力点检查清单更新至 M3.0 实际状态
+  （✅/🔶/⏸ 三级标记；模块 05 系统集成整体搁置为扩展项）。
+
+## 2026-08-24 — M3.0 全局交互升级（命令面板 + 可折叠侧边栏 + Toast + Dashboard 可视化 + 空状态）
+
+状态：完成（前端，参考 Linear/Stripe/Vercel 交互范式）
+
+新增 `frontend/src/components/ui.tsx`（全局 UI 基件，单一文件五件套）：
+
+- **图标系统**：内联 SVG `Icon` 组件（Lucide 风格 24×24 stroke，currentColor），25 个图标
+  替代 emoji；零依赖、零字体文件。
+- **全局 Toast**：`toast(text, kind)` 模块级函数（无需 context），右下角堆叠（最多 4 条），
+  success/error/info 圆形图标 + 滑入动画 + 3.4s 自动消失。requirements 页简易 toast 已迁移。
+- **命令面板 CommandPalette**：Ctrl/Cmd+K 呼出，模糊匹配打分（连续命中加权），
+  ↑↓/Enter/ESC 键盘导航，动作（新建分析/折叠侧边栏/复制链接）+ 全部页面导航。
+- **骨架屏 Skeleton**：呼吸渐变加载占位，Dashboard 首屏使用。
+- **空状态 EmptyState**：渐变图标 + 标题 + 引导按钮（如"前往需求分析"），替代干瘪文字提示。
+
+`layout.tsx` 重构：
+
+- 侧边栏：菜单分组标题（分析/质量/系统）、SVG 图标、渐变活跃态 + 左侧指示条、
+  **可折叠**（Ctrl/Cmd+B，状态存 localStorage，64px 图标态）、品牌 Logo 徽标。
+- 侧边栏顶部 cmdk 搜索按钮（⌘ 风格 kbd 提示）+ topbar 右侧 Ctrl K 按钮。
+- 全局快捷键：Ctrl+K 面板、Ctrl+B 折叠侧边栏（与主流 IDE 一致）。
+
+`dashboard.tsx` 重构（数据可视化）：
+
+- **SVG 平滑趋势图**（Catmull-Rom → Bezier 曲线 + 面积渐变 + 网格线 + 悬浮放大点 + 末值标注）
+  替代旧 div 条形图。
+- **环形图**：任务状态分布（已完成/进行中/失败，hover 分段高亮）。
+- **统计卡 v2**：图标 + 大数字 + sparkline 迷你趋势 + 环比提示，hover 浮起。
+- DSH 状态卡压缩进环形图右侧（呼吸灯徽章 + 紧凑 kv），一屏信息密度更高。
+- 最近任务表：运行中显示渐变进度条、标题/ID 双行、hover 才显示"打开"链接。
+- 状态中文标签（已完成/进行中/失败/排队中）替代英文原词。
+
+styles.css：侧边栏深色 #0e1830 + 分组标题 + 折叠动画（width .28s ease）；新组件样式段
+（toast-host/cp-mask/stat-card/empty-state/pbar 等）；表格 hover 行、选中文字色、字体平滑。
+
+验证：esbuild 构建通过（`dist/assets/app.js` 217.3kb / 36ms，含全部新组件）。
+需浏览器实测的交互（Ctrl+K 面板、侧边栏折叠、Toast、Dashboard 趋势图）由用户在 8090
+页面验收；代码层 TypeScript 无类型错误。
+
+遗留（M3.1 候选）：命令面板接入"最近任务"快速打开；报告中心/证据中心空状态统一迁移；
+Dashboard 趋势图 y 轴自适应刻度。
+
 ## 2026-08-21 — M2.2 需求分析页体验升级（模型热切换 + 粘贴上传 + 流程轨道 + 结果重设计）
 
 状态：完成（用户 8 点反馈逐项闭环）

@@ -49,7 +49,7 @@ export function ProjectsPage() {
             </tbody>
           </table>
         )}
-        <p className="hint">代码索引与 commit 快照能力将在 M1/M2 落地（DSH 语义扫描 + 证据入库）。</p>
+        <p className="hint">commit 快照已随分析任务入库；结构化代码索引（符号级检索）排期 M5。</p>
       </div>
     </>
   )

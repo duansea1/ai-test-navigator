@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.dsh import agents as agent_registry
 from app.dsh.runtime import manager as dsh_manager
 from app.db import entities
+from app.services.agent_validation import ValidationReport, validate_stage
 from app.services.analyzer import NavigatorAnalyzer
 from app.services.reporter import write_reports
 
@@ -232,15 +233,17 @@ def _activity_handler(task_id: str, agent_id: str):
     return handler
 
 
-def _run_agent(task_id: str, agent_id: str, payload: str) -> tuple[Any, dict | None]:
-    """执行单个 Agent 回合（独立会话，防上下文串味）。
+def _run_agent(task_id: str, agent_id: str, payload: str,
+               items: list[dict[str, Any]] | None = None) -> tuple[Any, dict | None, ValidationReport]:
+    """执行单个 Agent 回合（独立会话，防上下文串味）+ 输出强校验。
 
     聊天时间线：agent_start（含模型信息）→ tool/text 增量 → 由调用方推 agent_end。
-    返回 (提取结果, 原始会话信息)。
+    返回 (校验后结果, 原始会话信息, 校验报告)；执行失败时结果为 None。
     """
+    report = ValidationReport()
     prompt = agent_registry.build_agent_prompt(agent_id, payload)
     if prompt is None:
-        return None, None
+        return None, None, report
     s = get_settings()
     _push_activity(task_id, agent_id, "agent_start",
                    model=s.dsh_model, provider=s.dsh_provider,
@@ -248,19 +251,67 @@ def _run_agent(task_id: str, agent_id: str, payload: str) -> tuple[Any, dict | N
     result = dsh_manager.run_turn(prompt, session_id=f"{task_id}--{agent_id}",
                                   on_event=_activity_handler(task_id, agent_id))
     if result.get("status") != "ok":
+        entities.save_agent_session(task_id, agent_id, result.get("session_id", ""), "failed", 1)
         _push_activity(task_id, agent_id, "agent_end", ok=False,
                        summary=str(result.get("message", "执行失败"))[:300])
-        return None, result
+        return None, result, report
     entities.save_agent_session(task_id, agent_id, result.get("session_id", ""), "ok", 1)
     extracted = _extract_json(result.get("final_response", ""))
+    validated, report = validate_stage(agent_id, extracted, items)
     _push_activity(task_id, agent_id, "agent_end", ok=True,
                    preview=(result.get("final_response") or "")[:800])
-    return extracted, result
+    return validated, result, report
 
 
-def _agent_done(task_id: str, agent_id: str, ok: bool, summary: str) -> None:
-    """阶段结论（含数量统计）追加到 Agent 卡片尾部。"""
-    _push_activity(task_id, agent_id, "result", ok=ok, summary=summary[:400])
+def _validation_is_poor(items: Any, report: ValidationReport) -> bool:
+    """校验质量差判定：驱动 requirement-analyst 重问一次。
+
+    两种形态都算差：① 全丢/全修（模型输出没一条原样合法）；② 空结果但模型
+    声称有需求（这层分不出「真没需求」还是「输出坏了」，重问一次成本远低于
+    建错任务——真没需求时第二次仍为空，两次一致即采信）。"""
+    if report.total == 0 and report.dropped > 0:
+        return True  # 全部被丢：格式崩了
+    if not items and report.dropped == 0 and report.repaired == 0:
+        return True  # 空输出：再确认一次（拿不准时多问一句，不猜）
+    if report.total > 0 and (report.repaired + report.dropped) >= report.total:
+        return True  # 没有一条原样合法：契约没吃进去
+    return False
+
+
+def _reask_agent(task_id: str, agent_id: str, payload: str,
+                 prev_output: str, report: ValidationReport,
+                 items: list[dict[str, Any]] | None = None) -> tuple[Any, ValidationReport]:
+    """校验失败后同会话重问一次：带上一次的输出与校验反馈，模型原地修正。
+
+    返回 (重问后的校验结果, 新校验报告)；重问仍失败/更差时返回 (None, 新报告)，
+    由调用方决定是否沿用第一次结果。"""
+    feedback = "；".join((report.repairs + report.drops)[:5]) or "输出与契约不符"
+    reask = (
+        f"你上一次的输出没有通过结构校验，问题：{feedback}。\n"
+        f"上次输出（截断）：\n{prev_output[:1500]}\n\n"
+        "请严格按输出契约重新输出完整 JSON（不要解释、不要 markdown 围栏包裹以外的文字）。"
+    )
+    _push_activity(task_id, agent_id, "tool",
+                   tool="validate_retry",
+                   detail=f"校验未过（{report.summary()}），同会话重问一次")
+    result = dsh_manager.run_turn(reask, session_id=f"{task_id}--{agent_id}",
+                                  on_event=_activity_handler(task_id, agent_id))
+    if result.get("status") != "ok":
+        return None, report
+    extracted = _extract_json(result.get("final_response", ""))
+    validated, new_report = validate_stage(agent_id, extracted, items)
+    _push_activity(task_id, agent_id, "agent_end", ok=True,
+                   preview=(result.get("final_response") or "")[:800])
+    return validated, new_report
+
+
+def _agent_done(task_id: str, agent_id: str, ok: bool, summary: str,
+                report: ValidationReport | None = None) -> None:
+    """阶段结论（含数量统计 + 校验明细）追加到 Agent 卡片尾部。"""
+    if report is not None and (report.repaired or report.dropped):
+        detail = "；".join((report.repairs + report.drops)[:3])
+        summary = f"{summary}（校验：{report.summary()}。{detail}）"
+    _push_activity(task_id, agent_id, "result", ok=ok, summary=summary[:600])
 
 
 def _requirement_digest(items: list[dict[str, Any]], limit: int = 12) -> str:
@@ -312,10 +363,26 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
         source_text = task["source_text"] or ""
 
-        # ── 阶段 1：需求结构化（requirement-analyst）────────────────────────
+        # ── 阶段 1：需求结构化（requirement-analyst，校验差时同会话重问一次）──
         _emit(task_id, "requirement-analyst", 28, "Agent[需求分析] 正在解析需求条目")
-        items, session = _run_agent(task_id, "requirement-analyst", source_text[:6000])
+        items, session, vrep = _run_agent(task_id, "requirement-analyst", source_text[:6000])
         dsh_mode = items is not None
+        if dsh_mode and _validation_is_poor(items, vrep):
+            # 校验质量差（全修/全丢/空输出）：带着校验反馈同会话重问一次
+            raw_prev = (session or {}).get("final_response", "") if isinstance(session, dict) else ""
+            items2, vrep2 = _reask_agent(task_id, "requirement-analyst", source_text[:6000],
+                                         raw_prev, vrep)
+            if not _validation_is_poor(items2, vrep2):
+                # 重问通过：采信重问结果
+                items, vrep = items2, vrep2
+                _push_activity(task_id, "requirement-analyst", "result", ok=True,
+                               summary=f"重问后通过校验：{vrep.summary()}")
+            elif items2 is not None:
+                # 两次都差但重问非空：取修复更少的一次（离契约更近）
+                if vrep2.repaired + vrep2.dropped <= vrep.repaired + vrep.dropped:
+                    items, vrep = items2, vrep2
+            # items2 is None：重问执行失败，保留第一次
+            dsh_mode = items is not None
         if not dsh_mode:
             items = _rule_fallback_requirements(report)
             degraded.append("requirement-analyst")
@@ -323,7 +390,8 @@ def _run_task(task_id: str, mode: str = "full") -> None:
             _agent_done(task_id, "requirement-analyst", False, f"DSH 未参与，规则解析 {len(items)} 条需求")
         else:
             _emit(task_id, "requirement-analyst", 32, f"Agent[需求分析] 输出 {len(items)} 条结构化需求")
-            _agent_done(task_id, "requirement-analyst", True, f"输出 {len(items)} 条结构化需求（含优先级与验收标准）")
+            _agent_done(task_id, "requirement-analyst", True,
+                        f"输出 {len(items)} 条结构化需求（含优先级与验收标准）", vrep)
         entities.save_requirements(task_id, items)
 
         if not items:
@@ -337,7 +405,7 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 阶段 2：项目相关性（project-scout）
             _emit(task_id, "project-scout", 38, "Agent[项目侦察] 正在判断项目相关性")
-            relevant_projects, _ = _run_agent(
+            relevant_projects, _, vrep = _run_agent(
                 task_id, "project-scout",
                 f"项目清单：{', '.join(projects) if projects else '（未指定，workspace 下自行判断）'}\n"
                 f"工作区：{workspace}\n\n需求条目：\n{req_digest}")
@@ -350,21 +418,24 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 if names:
                     projects = names[:5]
                 _emit(task_id, "project-scout", 42, f"Agent[项目侦察] 相关项目：{', '.join(names or projects)}")
-                _agent_done(task_id, "project-scout", True, f"相关项目：{', '.join(names or projects)}")
+                _agent_done(task_id, "project-scout", True,
+                            f"相关项目：{', '.join(names or projects)}", vrep)
 
             # 阶段 3：代码证据（code-locator，可实查源码）
             _emit(task_id, "code-locator", 50, "Agent[代码定位] 正在检索源码定位证据")
-            evidence, _ = _run_agent(
+            evidence, _, vrep = _run_agent(
                 task_id, "code-locator",
                 f"你可以使用 glob/grep/read 工具在源码工作区实际检索。\n"
                 f"工作区：{workspace}（项目：{', '.join(projects) if projects else '自行探索'}）\n\n"
                 f"需求条目：\n{req_digest}\n\n"
-                "请实际检索源码，输出 JSON：evidence[{{project,path,line,symbol,snippet,confidence(0-1)}}]。")
+                "请实际检索源码，输出 JSON：evidence[{{project,path,line,symbol,snippet,"
+                "requirement_id(REQ-xxx),confidence(0-1)}}]。每条证据标注支撑哪条需求。",
+                items=items)
             if isinstance(evidence, list) and evidence:
                 n = entities.save_code_evidence(task_id, evidence)
                 _emit(task_id, "code-locator", 56, f"Agent[代码定位] 定位 {n} 处代码证据")
                 _agent_done(task_id, "code-locator", True,
-                            f"实查源码定位 {n} 处代码证据（含文件路径/行号/符号）")
+                            f"实查源码定位 {n} 处代码证据（含文件路径/行号/符号）", vrep)
             else:
                 degraded.append("code-locator")
                 _emit(task_id, "code-locator", 56, "代码证据定位失败/无结果，跳过该阶段")
@@ -372,14 +443,14 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 阶段 4：调用链（call-chain）
             _emit(task_id, "call-chain", 62, "Agent[调用链] 正在分析跨项目调用链")
-            chains, _ = _run_agent(
+            chains, _, vrep = _run_agent(
                 task_id, "call-chain",
                 f"项目：{', '.join(projects)}\n\n需求条目：\n{req_digest}\n\n"
                 "输出 JSON：chains[{{name,risk(high|medium|low),steps[{{project,component,call}}]}}]。")
             if isinstance(chains, list) and chains:
                 n = entities.save_impact_scopes(task_id, chains)
                 _emit(task_id, "call-chain", 66, f"Agent[调用链] 识别 {n} 条影响链路")
-                _agent_done(task_id, "call-chain", True, f"识别 {n} 条跨项目影响链路")
+                _agent_done(task_id, "call-chain", True, f"识别 {n} 条跨项目影响链路", vrep)
             else:
                 degraded.append("call-chain")
                 _emit(task_id, "call-chain", 66, "调用链分析失败/无结果，跳过该阶段")
@@ -388,11 +459,12 @@ def _run_task(task_id: str, mode: str = "full") -> None:
             # 阶段 5：实现审查（impl-reviewer，暂存内存待合并）
             _emit(task_id, "impl-reviewer", 72, "Agent[实现审查] 正在逐条对比需求与实现")
             ev_digest = _evidence_digest(entities.list_code_evidence(task_id))
-            impl_result, _ = _run_agent(
+            impl_result, _, vrep = _run_agent(
                 task_id, "impl-reviewer",
                 f"需求条目：\n{req_digest}\n\n代码证据：\n{ev_digest or '（无代码证据）'}\n\n"
                 "输出 JSON：assessments[{{requirement_id,status(implemented|partially_implemented|not_found|uncertain),"
-                "verdict(pass|fail|blocked|needs_review),confidence,evidence_refs[],gaps[]}}]。")
+                "verdict(pass|fail|blocked|needs_review),confidence,evidence_refs[],gaps[]}}]。",
+                items=items)
             if not isinstance(impl_result, list):
                 impl_result = None
                 degraded.append("impl-reviewer")
@@ -400,7 +472,8 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 _agent_done(task_id, "impl-reviewer", False, "实现审查失败，跳过该阶段")
             else:
                 _emit(task_id, "impl-reviewer", 76, f"Agent[实现审查] 完成 {len(impl_result)} 条审查结论")
-                _agent_done(task_id, "impl-reviewer", True, f"完成 {len(impl_result)} 条逐项实现审查结论")
+                _agent_done(task_id, "impl-reviewer", True,
+                            f"完成 {len(impl_result)} 条逐项实现审查结论", vrep)
 
             # 分析模式：只跑需求结构化 + 代码定位 + 实现审查，不生成用例/报告
             if mode == "analyze":
@@ -412,15 +485,16 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 阶段 6：测试用例（test-designer）
             _emit(task_id, "test-designer", 82, "Agent[测试设计] 正在生成五类测试用例")
-            cases, _ = _run_agent(
+            cases, _, vrep = _run_agent(
                 task_id, "test-designer",
                 f"需求条目：\n{req_digest}\n\n"
                 "输出 JSON：cases[{{requirement_id,title,kind(functional|negative|boundary|idempotency|security),"
-                "preconditions[],steps[],expected}}]。")
+                "preconditions[],steps[],expected}}]。",
+                items=items)
             if isinstance(cases, list) and cases:
                 n = entities.save_test_cases(task_id, cases)
                 _emit(task_id, "test-designer", 86, f"Agent[测试设计] 生成 {n} 条测试用例")
-                _agent_done(task_id, "test-designer", True, f"生成 {n} 条五类测试用例")
+                _agent_done(task_id, "test-designer", True, f"生成 {n} 条五类测试用例", vrep)
             else:
                 degraded.append("test-designer")
                 _emit(task_id, "test-designer", 86, "测试用例生成失败/无结果，跳过该阶段")
@@ -428,10 +502,11 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 阶段 7：质量裁决（quality-judge，与 impl-reviewer 合并入库）
             _emit(task_id, "quality-judge", 90, "Agent[质量裁决] 正在评估风险与上线建议")
-            verdicts, _ = _run_agent(
+            verdicts, _, vrep = _run_agent(
                 task_id, "quality-judge",
                 f"需求条目：\n{req_digest}\n\n实现审查：\n{json.dumps(impl_result, ensure_ascii=False)[:2000] if impl_result else '（无）'}\n\n"
-                "输出 JSON：verdicts[{{requirement_id,risk(high|medium|low),rationale,recommendation}}]。")
+                "输出 JSON：verdicts[{{requirement_id,risk(high|medium|low),rationale,recommendation}}]。",
+                items=items)
             merged = _merge_assessments(items, impl_result, verdicts)
             if merged:
                 entities.save_assessments(task_id, merged)
@@ -440,7 +515,7 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 _emit(task_id, "quality-judge", 93,
                       f"Agent[质量裁决] {len(merged)} 条结论（高风险 {high}，待复核 {review}）")
                 _agent_done(task_id, "quality-judge", True,
-                            f"{len(merged)} 条裁决结论（高风险 {high}，待复核 {review}）")
+                            f"{len(merged)} 条裁决结论（高风险 {high}，待复核 {review}）", vrep)
             else:
                 degraded.append("quality-judge")
                 _emit(task_id, "quality-judge", 93, "质量裁决失败，跳过该阶段")
@@ -448,21 +523,18 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 阶段 8：报告摘要（report-writer）
             _emit(task_id, "report-writer", 96, "Agent[报告] 正在生成三视角摘要")
-            views_raw, _ = _run_agent(
+            views_raw, _, vrep = _run_agent(
                 task_id, "report-writer",
                 f"需求条目：\n{req_digest}\n\n"
                 f"实现审查：{json.dumps(impl_result, ensure_ascii=False)[:1500] if impl_result else '无'}\n\n"
                 f"测试用例数：{len(entities.list_test_cases(task_id))}\n\n"
                 "输出 JSON：views{{dev,qa,product}}，每项是面向该角色的中文结论摘要。")
-            # 模型可能输出 {"views":{...}} 或裸 {"dev","qa","product"}，两种都兼容
-            if isinstance(views_raw, dict) and isinstance(views_raw.get("views"), dict):
-                views = views_raw["views"]
-            else:
-                views = views_raw
+            # 校验层已兼容 {"views":{...}} 与裸 {"dev","qa","product"} 两种输出
+            views = views_raw
             if isinstance(views, dict) and any(views.get(k) for k in ("dev", "qa", "product")):
                 entities.save_report_views(task_id, views)
                 _emit(task_id, "report-writer", 98, "Agent[报告] 三视角摘要完成")
-                _agent_done(task_id, "report-writer", True, "研发/测试/产品三视角摘要完成")
+                _agent_done(task_id, "report-writer", True, "研发/测试/产品三视角摘要完成", vrep)
             else:
                 degraded.append("report-writer")
                 _emit(task_id, "report-writer", 98, "报告摘要失败，跳过该阶段")

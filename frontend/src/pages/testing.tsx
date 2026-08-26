@@ -1,5 +1,6 @@
 import React from 'react'
 import { getJson } from '../api'
+import { EmptyState } from '../components/ui'
 
 interface TestingData {
   status: string
@@ -19,7 +20,9 @@ export function TestingPage() {
   return (
     <div className="card">
       <h3>测试执行引擎 <span className="badge neutral">{data.milestone}</span></h3>
-      <p className="hint">{data.message}</p>
+      <EmptyState icon="flask" title="测试执行引擎排期 M4"
+        desc={data.message}
+        action="前往需求分析" onAction={() => { location.hash = '/requirements' }} />
       <h3 style={{ marginTop: 18 }}>规划能力</h3>
       <table>
         <thead><tr><th>#</th><th>能力</th></tr></thead>

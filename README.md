@@ -5,13 +5,9 @@
 ## 当前能力
 
 - 支持直接输入需求文字、上传文档、图片和多个附件
-- 读取 Markdown 需求文档并提取标题/列表需求项
-- 扫描 Java、Vue、JavaScript 源码并生成代码证据
-- 按项目生成影响范围
-- 生成正常、异常、边界、幂等、权限测试用例
-- 输出 JSON、Markdown、HTML 报告
-- 可选接入 DeepSeek Harness Python SDK；没有 API Key 或 Windows 运行时不可用时自动使用离线规则分析
-- 预留本地 MySQL `ai-navigator` 数据库接入，配置见 `.env.example` 和 `plansea/DATABASE.md`
+- React 交互工作台（命令面板 Ctrl+K / 可折叠侧栏 / 实时 Agent 活动流，核心入口 `/#/requirements`）
+- 8-Agent 语义分析流水线（需求结构化 → 项目侦察 → 代码定位 → 调用链 → 实现审查 → 测试设计 → 质量裁决 → 三视角报告），输出强校验后入库
+- 本地 MySQL `ai-navigator` 数据库持久化（11 表，任务/需求/证据/用例/裁决全链路），配置见 `.env.example` 和 `plansea/DATABASE.md`
 
 ## 一键启动
 
@@ -72,8 +68,8 @@ python backend\app\cli.py --requirement requirements\passport-ocr-demo.md --proj
 
 ## DSH 语义分析
 
-DSH 仅作为可选增强层。配置 `DEEPSEEK_API_KEY` 后，在支持的 Linux/macOS/WSL2 环境运行；Windows 原生环境优先使用离线规则分析。密钥不写入配置文件。
+Agent Runtime 基于 DeepSeek Harness（DSH）源码集成（Windows 经 node 载体运行），支持子代理、工作流、Skills 与多模型热切换；密钥不写入配置文件（`~/.dsh/.credentials.yaml` 或环境变量）。DSH 不可用时自动降级离线规则分析，任务不失败。详见 `plansea/PLAN.md` §0.3。
 
 ## 设计边界
 
-MVP 默认只读扫描源码、读取 Git commit 和生成报告，不修改业务项目、不执行推送、不切换分支。测试执行器和 React 页面将在后续阶段接入。
+默认只读扫描源码、读取 Git commit 和生成报告，不修改业务项目、不执行推送、不切换分支。测试执行引擎（白名单 + dry-run）排期 M4；图片/二进制附件当前仅登记元数据，OCR 视觉解析未接入。
