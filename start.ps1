@@ -31,12 +31,39 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# 3. 后台启动后端
+# 3. 前端构建：frontend/dist 是 .gitignore 的（不随 push 传输），新机器首次启动
+#    或前端代码改动后必须重新构建。node 可用就自动构建，确保"改了代码 → 双击
+#    start.bat → 生效"；node 不可用就跳过（后端照样起，只是前端是旧 dist）。
+#    build-frontend.mjs 用 process.cwd() 当源目录，所以必须在 frontend/ 下跑。
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+if ($nodeCmd) {
+    Write-Host 'Building frontend (esbuild)...' -ForegroundColor Cyan
+    $buildScript = Join-Path $root 'scripts\build-frontend.mjs'
+    Push-Location (Join-Path $root 'frontend')
+    $buildOk = $false
+    try {
+        & $nodeCmd.Source $buildScript
+        $buildOk = $LASTEXITCODE -eq 0
+    } catch {
+        $buildOk = $false
+    } finally {
+        Pop-Location
+    }
+    if (-not $buildOk) {
+        Write-Host 'Frontend build failed — backend will still start (frontend may be stale).' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Frontend built OK.' -ForegroundColor Green
+    }
+} else {
+    Write-Host 'node not found — skipping frontend build (frontend may be stale).' -ForegroundColor Yellow
+}
+
+# 4. 后台启动后端
 $url = "http://127.0.0.1:{0}/" -f $port
 Write-Host ("Starting AI Test Navigator at {0}" -f $url) -ForegroundColor Green
 Start-Process -FilePath $python -ArgumentList "-m uvicorn app.main:app --host 127.0.0.1 --port $port" -WorkingDirectory $root
 
-# 4. 轮询等待端口就绪，再打开浏览器（带缓存破坏参数，确保看到最新前端）
+# 5. 轮询等待端口就绪，再打开浏览器（带缓存破坏参数，确保看到最新前端）
 $cb = [DateTimeOffset]::Now.ToUnixTimeSeconds()
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
