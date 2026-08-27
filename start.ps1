@@ -32,30 +32,26 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 3. 前端构建：frontend/dist 是 .gitignore 的（不随 push 传输），新机器首次启动
-#    或前端代码改动后必须重新构建。node 可用就自动构建，确保"改了代码 → 双击
-#    start.bat → 生效"；node 不可用就跳过（后端照样起，只是前端是旧 dist）。
+#    或前端代码改动后必须重新构建。改了代码 → 双击 start.bat → 自动构建 + 重启
+#    + 开浏览器即看到最新。node 不可用就跳过（后端照样起，前端保持旧 dist）。
 #    build-frontend.mjs 用 process.cwd() 当源目录，所以必须在 frontend/ 下跑。
-$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-if ($nodeCmd) {
-    Write-Host 'Building frontend (esbuild)...' -ForegroundColor Cyan
-    $buildScript = Join-Path $root 'scripts\build-frontend.mjs'
-    Push-Location (Join-Path $root 'frontend')
+#    用「试调 node」而非 Get-Command 解析路径——PowerShell 非交互 -File 模式下
+#    Get-Command 对 PATH 里的可执行文件解析不稳定（会误判为找不到）。
+$buildScript = Join-Path $root 'scripts\build-frontend.mjs'
+Push-Location (Join-Path $root 'frontend')
+$buildOk = $false
+try {
+    & node $buildScript
+    $buildOk = $LASTEXITCODE -eq 0
+} catch {
     $buildOk = $false
-    try {
-        & $nodeCmd.Source $buildScript
-        $buildOk = $LASTEXITCODE -eq 0
-    } catch {
-        $buildOk = $false
-    } finally {
-        Pop-Location
-    }
-    if (-not $buildOk) {
-        Write-Host 'Frontend build failed — backend will still start (frontend may be stale).' -ForegroundColor Yellow
-    } else {
-        Write-Host 'Frontend built OK.' -ForegroundColor Green
-    }
+} finally {
+    Pop-Location
+}
+if (-not $buildOk) {
+    Write-Host 'Frontend build skipped or failed — backend will still start.' -ForegroundColor Yellow
 } else {
-    Write-Host 'node not found — skipping frontend build (frontend may be stale).' -ForegroundColor Yellow
+    Write-Host 'Frontend built OK.' -ForegroundColor Green
 }
 
 # 4. 后台启动后端
