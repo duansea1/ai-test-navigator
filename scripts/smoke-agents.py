@@ -260,11 +260,15 @@ def main() -> int:
         rt.classify("你好")  # 无会话 → 全局路由会话
     finally:
         rt.dsh_manager.run_turn = orig
-    check("会话回合用 conv-xxx--router 会话",
-          seen_sessions[0] == "conv-abc--router", f"got {seen_sessions[0]!r}")
-    check("qa/classify 共用同一路由会话",
-          seen_sessions[1] == "conv-abc--router")
-    check("无会话回退 router-global", seen_sessions[2] == "router-global")
+    # 2026-08-27 修复：classify 与 qa_answer 是不同 Agent，不能共用一条 DSH 会话——
+    # 第一回合把会话定型成意图分类器（输出 JSON），第二回合塞 qa prompt 进去会被
+    # 上下文污染，模型易续写 JSON 导致 final_response 为空（"模型未返回内容"）。
+    # 现在按 Agent 分会话：classify→conv-xxx--intent，qa→conv-xxx--qa。
+    check("classify 用 conv-xxx--intent 会话",
+          seen_sessions[0] == "conv-abc--intent", f"got {seen_sessions[0]!r}")
+    check("qa 用 conv-xxx--qa 会话（与 classify 分离）",
+          seen_sessions[1] == "conv-abc--qa", f"got {seen_sessions[1]!r}")
+    check("无会话 classify 回退 router-global--intent", seen_sessions[2] == "router-global--intent")
     check("提示词含意图分类规则", "意图分类器" in seen_prompts[0])
     check("提示词含问答规则", "助手" in seen_prompts[1])
 

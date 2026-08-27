@@ -79,9 +79,15 @@ def _agent_prompt(agent_id: str) -> str:
     return agent.system_prompt if agent else ""
 
 
-def _router_session(conversation_id: str | None) -> str:
-    """每个会话一条常驻 DSH 路由会话：同 conversation_id 的回合共享上下文。"""
-    return f"conv-{conversation_id}--router" if conversation_id else "router-global"
+def _router_session(conversation_id: str | None, role: str = "router") -> str:
+    """每个会话 × 每个路由 Agent 一条独立 DSH 会话。
+
+    2026-08-27 修复：classify（intent-classifier）与 qa_answer（qa-assistant）是
+    **两个不同 Agent**，system_prompt 不同——若共用一条 DSH 会话，第一回合把会话
+    定型成意图分类器（输出 JSON），第二回合塞 qa-assistant 的 prompt 进去会污染
+    上下文，模型易续写 JSON 或只产思考链不产正文 → final_response 为空
+    （「模型未返回内容」）。现在按 Agent 分会话，各自干净、各自保留多轮记忆。"""
+    return f"conv-{conversation_id}--{role}" if conversation_id else f"router-global--{role}"
 
 
 def _history_block(conversation_id: str | None) -> str:
@@ -115,7 +121,7 @@ def classify(text: str, conversation_id: str | None = None) -> dict:
     prompt = _agent_prompt("intent-classifier")
     history = _history_block(conversation_id)
     res = _dsh_turn(f"{prompt}\n\n{history}用户输入：{t}",
-                    _router_session(conversation_id)) if prompt else {"status": "error"}
+                    _router_session(conversation_id, "intent")) if prompt else {"status": "error"}
     if res.get("status") == "ok":
         data = _extract_intent(res.get("final_response", ""))
         if data:
@@ -138,7 +144,7 @@ def qa_answer(text: str, conversation_id: str | None = None) -> str:
     prompt = _agent_prompt("qa-assistant")
     history = _history_block(conversation_id)
     res = _dsh_turn(f"{prompt}\n\n{history}用户：{t}",
-                    _router_session(conversation_id)) if prompt else {"status": "error"}
+                    _router_session(conversation_id, "qa")) if prompt else {"status": "error"}
     if res.get("status") == "ok":
         return (res.get("final_response") or "").strip() or "（模型未返回内容）"
     return _OFFLINE_REPLY

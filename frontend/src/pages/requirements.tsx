@@ -506,6 +506,8 @@ export function RequirementsPage() {
   }
 
   function openTask(id: string) {
+    // 只切到这个任务的活动流/结果；绝不清当前会话（任务就在会话里，清了会话
+    // 第二次发送就会新建会话——这是 2026-08-27 报的「第2次发送新增会话」的根因）。
     setActiveId(id)
     setTask(null)
     setActs([])
