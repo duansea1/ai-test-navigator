@@ -1,5 +1,5 @@
 import React from 'react'
-import { getJson, postForm, postJson, streamSse } from '../api'
+import { getJson, postForm, postJson, streamSse, delJson } from '../api'
 import { ModelModal } from '../components/ModelDrawer'
 import { toast as showToast, Icon } from '../components/ui'
 
@@ -575,6 +575,27 @@ export function RequirementsPage() {
     }).catch(() => {})
   }
 
+  /** 删除会话：连带删 chat_messages + 会话内全部任务及其衍生数据。
+  删当前会话 → 切回新会话视图；删别的 → 只刷新列表。二次确认防误删。 */
+  async function deleteConversation(id: string, title: string) {
+    const label = title || id
+    if (!window.confirm(`确定删除会话「${label}」？\n该会话内的所有任务和消息将一并删除，且不可恢复。`)) return
+    try {
+      const r = await delJson<{ deleted: boolean; deleted_tasks: string[] }>(`/api/conversations/${id}`)
+      const n = r?.deleted_tasks?.length ?? 0
+      showToast(`已删除会话「${label}」${n ? `（含 ${n} 个任务）` : ''}`, 'ok')
+      // 删的是当前会话：切回新会话视图
+      if (id === convId) {
+        newSession()
+      } else {
+        // 删别的会话：只刷新会话/任务列表
+        refreshHistory()
+      }
+    } catch (e) {
+      setFormErr(`删除会话失败：${e}`)
+    }
+  }
+
   /** 切换模型（运行时热切换）。 */
   /** 切换模型/供应商后刷新引擎状态（即时对新任务生效）。 */
   async function refreshRuntime() {
@@ -703,6 +724,8 @@ export function RequirementsPage() {
                 <div className="t-title">{c.title || c.conv_id}</div>
                 <div className="t-meta">
                   <span className="rel-time">{relTime(c.updated_at)}</span>
+                  <span className="t-del" title="删除会话"
+                    onClick={e => { e.stopPropagation(); deleteConversation(c.conv_id, c.title) }}>×</span>
                 </div>
               </div>
             ))}

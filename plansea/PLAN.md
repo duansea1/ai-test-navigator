@@ -98,6 +98,7 @@ Agent Runtime 层**不自研**。推理、工具、子代理、工作流、长�
 | M3.1 | 核心体验收尾：命令面板最近任务 / 三中心空状态 / y 轴刻度 / 技术债清理 / 4 处文案修正 | ✅ 完成（构建与浏览器验收待补） |
 | M3.2a | Agent 能力优化 + 多轮会话：10 Agent prompt 收紧 + 3 Skill 补齐 + call-chain steps 修复 + conversations/chat_messages（13 表）+ 校验失败重问 + 证据关联需求 | ✅ 完成（冒烟 108/0 通过；构建与浏览器待补） |
 | M3.2b | Agent 子代理赋能：每个流水线 Agent 升级为该阶段「主理」（对契约输出全权负责），能力不足时按 fork（同质并行/交叉验证）/ spawn（异质分治）委派再合成；新建 agent-collaboration 共享 Skill；路由层 2 Agent 轻量不委派 | ✅ 完成（冒烟 108/0 通过；DSH 真实委派待浏览器验收） |
+| M3.2c | 会话删除 + 路由 Agent 会话隔离修复：delete_conversation 级联删消息/任务/衍生七表 + DELETE API + 前端 × 按钮二次确认；classify/qa_answer 按 Agent 分会话修复「模型未返回内容」 | ✅ 完成（冒烟 123/0 + esbuild + live /api/chat 实测） |
 
 ---
 

@@ -1,5 +1,42 @@
 # AI Test Navigator 迭代记录
 
+## 2026-08-27 — 会话删除 + 路由 Agent 会话隔离修复（M3.2c）
+
+状态：代码完成 + 冒烟 **123 PASS / 0 FAIL** + 前端 esbuild 构建通过 + 8090 live `/api/chat` 实测返回正常
+
+### 一、会话删除功能（用户要求「会话支持删除」）
+
+- **DAL**（`entities.py`）：`delete_conversation(conv_id)` 级联删 `chat_messages` +
+  会话内全部任务 + 每个任务的七张衍生表（requirements/code_evidence/impact_scopes/
+  test_cases/assessments/reports/agent_sessions/dsh_events）。`delete_task(task_id)`
+  正交清任务衍生数据（会话删除时级联调用，也可独立用）。返回 `{existed, deleted_tasks}`。
+- **API**：`DELETE /api/conversations/{conv_id}`——会话不存在 404，存在则返回删除的任务清单。
+- **前端**：会话列表每项 hover 出现 × 删除按钮（`stopPropagation` 不触发打开），二次确认
+  防误删；删当前会话→自动切回新会话视图，删别的→只刷新列表；toast 提示含任务数。
+  `api.ts` 新增 `delJson` 通用 DELETE 助手。
+- **冒烟 [16]**：15 条断言验证级联删除——删会话清消息+任务+衍生数据、删不存在不崩、
+  `delete_task` 正交清七表、删不存在任务返回 False。
+
+### 二、路由 Agent 会话隔离修复（上一轮遗留，用户 live 报「模型未返回内容」）
+
+- **根因**：`classify`（intent-classifier）与 `qa_answer`（qa-assistant）是两个不同 Agent，
+  system_prompt 不同，却共用一条 DSH 路由会话 `conv-xxx--router`。第一回合把会话定型成
+  意图分类器（输出 JSON），第二回合塞 qa prompt 进去被上下文污染，模型续写 JSON 或只
+  产思考链 → `final_response` 为空 → 显示「（模型未返回内容）」。
+- **修复**：`_router_session` 按 Agent 分会话——classify→`conv-xxx--intent`，
+  qa→`conv-xxx--qa`。各自干净、各自保留多轮记忆。live 实测 `/api/chat` 第二轮回答 368 字非空。
+- 冒烟 [12] 更新为分会话断言（`conv-abc--intent` / `conv-abc--qa`）。
+
+### 三、前端 `openTask` 不清会话（「第2次发送新增会话」根因）
+
+- `openTask` 入口加防护：切任务详情只清活动流/结果，绝不清 `convId`/`messages`。
+  任务就在会话里，清了会话第二次发送会被当首条消息→新建会话。
+
+### 四、MySQL 方言兼容
+
+- 冒烟原用 `INSERT OR IGNORE`（SQLite 语法），MySQL 不认 → 改为先 `DELETE` 再 `INSERT`
+  的方言中性写法。
+
 ## 2026-08-26 — Agent 子代理赋能：每个 Agent 成为该阶段主理，能力不足由子代理弥补（M3.2b）
 
 状态：代码完成 + 冒烟 **108 PASS / 0 FAIL**（`python scripts/smoke-agents.py` 全绿通过）

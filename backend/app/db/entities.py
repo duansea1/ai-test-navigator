@@ -588,6 +588,51 @@ def list_messages(conv_id: str, limit: int = 100) -> list[dict[str, Any]]:
     return rows
 
 
+# ─── repository：会话删除（M3.2c，2026-08-27）─────────────────────────────────
+
+# 任务关联的从表（删任务时一并清，避免孤儿数据）。与 analysis_tasks 无外键约束，
+# 手动维护清单——新增任务衍生表时记得追加。
+_TASK_CHILD_TABLES: tuple[str, ...] = (
+    "requirements", "code_evidence", "impact_scopes", "test_cases",
+    "assessments", "reports", "agent_sessions", "dsh_events",
+)
+
+
+def delete_task(task_id: str) -> bool:
+    """删除单个分析任务及其全部衍生数据（七表级联）。
+
+    会话删除时对会话内每个任务调用本函数；也可独立用于任务删除。
+    返回 True 表示 analysis_tasks 有该行被删。"""
+    existed = engine.scalar("SELECT 1 FROM analysis_tasks WHERE task_id = ?", (task_id,))
+    for tbl in _TASK_CHILD_TABLES:
+        engine.execute(f"DELETE FROM {tbl} WHERE task_id = ?", (task_id,))
+    engine.execute("DELETE FROM analysis_tasks WHERE task_id = ?", (task_id,))
+    return bool(existed)
+
+
+def delete_conversation(conv_id: str) -> dict[str, Any]:
+    """删除一个会话：连带删 chat_messages + 会话内所有任务及其衍生数据。
+
+    级联关系：会话 → chat_messages.task_id 指向的任务 → 任务衍生七表。
+    返回 {existed, deleted_tasks}。会话内的任务被全删（避免任务悬空没人能打开）。
+    """
+    conv = get_conversation(conv_id)
+    existed = conv is not None
+    # 先收集会话内挂的任务（删 chat_messages 前取，免得丢失引用）
+    task_rows = engine.query(
+        "SELECT DISTINCT task_id FROM chat_messages "
+        "WHERE conv_id = ? AND task_id IS NOT NULL AND task_id != ''",
+        (conv_id,),
+    )
+    deleted_tasks = [r["task_id"] for r in task_rows if r.get("task_id")]
+    engine.execute("DELETE FROM chat_messages WHERE conv_id = ?", (conv_id,))
+    engine.execute("DELETE FROM conversations WHERE conv_id = ?", (conv_id,))
+    # 级联删除会话内每个任务（任务的全套衍生数据跟着走）
+    for tid in deleted_tasks:
+        delete_task(tid)
+    return {"existed": existed, "deleted_tasks": deleted_tasks}
+
+
 # ─── repository：dashboard 聚合 ──────────────────────────────────────────────
 
 def dashboard_stats() -> dict[str, Any]:

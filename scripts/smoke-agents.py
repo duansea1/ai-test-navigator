@@ -351,6 +351,66 @@ def main() -> int:
     check("spawn 工具调用进活动流", "subagent" in tools, f"got {tools}")
     check("活动流 detail 含委派 prompt", "登录" in details, f"got {details[:120]!r}")
 
+    # ── 16. 会话删除：级联 chat_messages + 会话内任务及其衍生七表（2026-08-27）──
+    # 用户要求「会话支持删除」。删除一个会话要连带删：该会话的全部消息 +
+    # 会话内挂的每个任务 + 每个任务的衍生数据（requirements/code_evidence/...
+    # /agent_sessions/dsh_events）。delete_task 正交清七表。
+    print("[16] 会话删除（级联消息 + 任务 + 衍生数据）")
+    from app.db import entities as E2
+    _now = E2._now  # noqa: SLF001 — 复用 entities 的时间戳生成
+    # 建一个有消息+有任务的会话
+    cid = E2.create_conversation("删除测试会话")
+    E2.save_message(cid, "user", "帮我分析登录")
+    tid = "smoke-del-task-001"
+    # 先确保任务行存在（直接 insert，绕过 create_task 的异步编排）。
+    # 用先 DELETE 再 INSERT 的方言中性写法替代 INSERT OR IGNORE（MySQL 不认 OR IGNORE）。
+    E2.engine.execute(
+        "DELETE FROM analysis_tasks WHERE task_id = ?",
+        (tid,))
+    E2.engine.insert(
+        "INSERT INTO analysis_tasks (task_id, title, source_text, projects, branch, "
+        "workspace, status, created_at, updated_at) VALUES (?, ?, '', '', '', '', 'completed', ?, ?)",
+        (tid, "删除测试任务", _now(), _now()))
+    E2.save_message(cid, "assistant", "已创建分析任务", intent="analyze", task_id=tid)
+    # 给任务塞衍生数据（requirements 代表，验证级联）
+    E2.save_requirements(tid, [{"id": "REQ-001", "title": "登录锁定", "priority": "P0",
+                                "description": "", "acceptance_criteria": ["连续错误5次锁定"]}])
+    check("删除前会话存在", E2.get_conversation(cid) is not None)
+    check("删除前消息存在", len(E2.list_messages(cid)) == 2)
+    check("删除前任务衍生数据存在", len(E2.list_requirements(tid)) == 1)
+
+    res = E2.delete_conversation(cid)
+    check("delete_conversation 返回 existed=True", res["existed"])
+    check("delete_conversation 返回级联任务清单", tid in res["deleted_tasks"])
+    check("删除后会话不存在", E2.get_conversation(cid) is None)
+    check("删除后消息清空", len(E2.list_messages(cid)) == 0)
+    check("删除后任务衍生数据级联清空", len(E2.list_requirements(tid)) == 0)
+    check("删除后任务行级联清空", E2.get_task(tid) is None)
+
+    # 删不存在的会话：existed=False，不报错
+    res2 = E2.delete_conversation("no-such-conv")
+    check("删不存在会话 existed=False 不崩", res2["existed"] is False)
+
+    # delete_task 正交：单独删任务清七表（独立于会话）
+    tid2 = "smoke-del-task-002"
+    E2.engine.execute("DELETE FROM analysis_tasks WHERE task_id = ?", (tid2,))
+    E2.engine.insert(
+        "INSERT INTO analysis_tasks (task_id, title, source_text, projects, branch, "
+        "workspace, status, created_at, updated_at) VALUES (?, ?, '', '', '', '', 'completed', ?, ?)",
+        (tid2, "正交删除测试", _now(), _now()))
+    E2.save_requirements(tid2, [{"id": "REQ-001", "title": "x", "priority": "P1",
+                                  "description": "", "acceptance_criteria": []}])
+    E2.save_code_evidence(tid2, [{"project": "p", "path": "src/A.java", "line": 1,
+                                  "symbol": "x", "snippet": "", "confidence": 0.5,
+                                  "requirement_id": ""}])
+    ok = E2.delete_task(tid2)
+    check("delete_task 返回 True", ok is True)
+    check("delete_task 级联清 requirements", len(E2.list_requirements(tid2)) == 0)
+    check("delete_task 级联清 code_evidence", len(E2.list_code_evidence(tid2)) == 0)
+    check("delete_task 清任务行", E2.get_task(tid2) is None)
+    ok2 = E2.delete_task("never-existed")
+    check("delete_task 删不存在返回 False", ok2 is False)
+
     print(f"\n结果：{PASS} PASS / {FAIL} FAIL")
     return 1 if FAIL else 0
 

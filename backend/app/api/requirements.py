@@ -139,6 +139,20 @@ async def conversation_messages(conv_id: str) -> dict[str, object]:
     return {"conversation_id": conv_id, "messages": E.list_messages(conv_id)}
 
 
+@router.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str) -> dict[str, object]:
+    """删除会话：连带删 chat_messages + 会话内全部任务及其衍生数据。
+
+    会话内挂的任务被全删（任务悬空没人能打开没意义）；任务的七张衍生表跟着级联。
+    删当前打开的会话时前端应切回新会话视图。"""
+    from app.db import entities as E
+    res = E.delete_conversation(conv_id)
+    if not res["existed"]:
+        raise HTTPException(404, f"会话不存在：{conv_id}")
+    return {"conversation_id": conv_id, "deleted": True,
+            "deleted_tasks": res["deleted_tasks"]}
+
+
 @router.get("/requirements/tasks")
 async def list_tasks(limit: int = 50, status: str = "") -> dict[str, object]:
     return {"tasks": entities.list_tasks(limit=limit, status=status)}

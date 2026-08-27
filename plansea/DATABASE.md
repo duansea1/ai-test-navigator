@@ -54,6 +54,9 @@ mysql+pymysql://root:root@127.0.0.1:3306/ai-navigator?charset=utf8mb4
 
 ## 当前状态
 
+- ✅ 2026-08-27：`delete_conversation(conv_id)` + `delete_task(task_id)` 级联删除（M3.2c）——
+  删会话连带删 chat_messages + 会话内全部任务 + 任务衍生七表（requirements/code_evidence/
+  impact_scopes/test_cases/assessments/reports/agent_sessions/dsh_events）。表结构不变。
 - ✅ 2026-08-26：13 张表可重复执行（原 11 表 + `conversations` + `chat_messages`，M3.2a 多轮会话）；
   `code_evidence` 新增 `req_ref` 列（启动时 ALTER 轻量迁移）。
 - ✅ 2026-08-24：实际 11 张表已建齐并可重复执行（原 10 表 + `model_configs`）；

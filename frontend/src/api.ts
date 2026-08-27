@@ -47,3 +47,10 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
   if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
   return res.json() as Promise<T>
 }
+
+/** 通用 DELETE。 */
+export async function delJson<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
+  return res.json() as Promise<T>
+}
