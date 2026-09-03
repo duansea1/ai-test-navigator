@@ -99,6 +99,15 @@ Agent Runtime 层**不自研**。推理、工具、子代理、工作流、长�
 | M3.2a | Agent 能力优化 + 多轮会话：10 Agent prompt 收紧 + 3 Skill 补齐 + call-chain steps 修复 + conversations/chat_messages（13 表）+ 校验失败重问 + 证据关联需求 | ✅ 完成（冒烟 108/0 通过；构建与浏览器待补） |
 | M3.2b | Agent 子代理赋能：每个流水线 Agent 升级为该阶段「主理」（对契约输出全权负责），能力不足时按 fork（同质并行/交叉验证）/ spawn（异质分治）委派再合成；新建 agent-collaboration 共享 Skill；路由层 2 Agent 轻量不委派 | ✅ 完成（冒烟 108/0 通过；DSH 真实委派待浏览器验收） |
 | M3.2c | 会话删除 + 路由 Agent 会话隔离修复：delete_conversation 级联删消息/任务/衍生七表 + DELETE API + 前端 × 按钮二次确认；classify/qa_answer 按 Agent 分会话修复「模型未返回内容」 | ✅ 完成（冒烟 123/0 + esbuild + live /api/chat 实测） |
+| M3.3 | 需求分析页 chat.z.ai 风格重构 + 问答项目传参：composer 大盒子（项目/模式/附件/模型收成 chip，Enter 发送）、侧栏仅会话按时间分组、engine-bar 移除、欢迎页示例卡；/api/chat 带.projects 注入目标项目 | ✅ 完成（冒烟 127/0 + esbuild + live 实测；浏览器人工验收待做） |
+| M3.4 | 问答流式输出 + 附件链路修复 + UI 微交互：/api/chat/stream SSE 打字机（router._stream_turn + qa_answer on_delta）；/api/chat 接 attachments 文本并入提问、图片转建任务；多轮上限核实（无硬上限，注入 12 条兜底）；styles.css 打字机光标/弹层 focus 环/hover 底色 | ✅ 完成（冒烟 133/0 + esbuild + live 五场景实测 `scripts/live-chat-stream.py`；浏览器人工验收待做） |
+| M3.4.1 | 输入保真修复：/api/chat/stream 补 attachments 参数（此前附件整包被 FastAPI 静默丢弃）；_merge_text_attachments 双端点统一（文本并入/纯图→analyze 终帧/混合注名）；前端删 hasBinary 本地拦截统一走后端裁决 | ✅ 完成（冒烟 140/0 + live 七场景） |
+| M3.5 | Agent 间上下文传递 + 输出侧记忆闭环：digest 超限显式注明（需求 12/证据 15 不再静默截断）；evidence digest 带 160 字代码摘录；call-chain/test-designer/quality-judge 补上游产物输入；任务结论回写会话（4 终态分支 + find_conversation_of_task 反查 + 前端 finish 同步）；路由韧性（重试退避 1.5s + 启发式句中问号/疑问词 + 「问结论=qa」prompt 消歧） | ✅ 完成（冒烟 155/0 + live 端到端闭环：建任务→8-Agent→结论回写→追问引用统计） |
+| M3.6 | 模型调用错误显式化（「模型未返回内容」黑盒）：run_turn 检测 finish_reason=error/空输出 → status=error + 真因；base_url 归一化（纯域名补 /v1，修 baoyun 网关全量 404）；classify 兜底 reason 说真话（模型失败/DSH 未就绪/解析失败三分）；qa_answer_result 结构化 {answer, model_error}；终帧带 model_error；模型切换即探测（同 URL 同参数保真：thinking/reasoning_effort 与 cordis 一致）；前端错误气泡 + 重试按钮 + 输入保留 + 切换警告 | ✅ 完成（冒烟 166/0 + live 三场景：坏模型真因透出/网关不兼容显式报错/切回恢复正常） |
+| M3.7 | 模型选型持久化 + 管理弹框重设计：app_settings 表 + manager 懒加载/落库（重启不再回默认）；reconfigure 支持 provider/model 分开换（模型不在新目录自动回落）；API {provider_key, model} 分离 + 探测真实生效目标；ModelDrawer 单选式重设计（点卡片切换/点 chip 选模型/弱化次要操作/停用置灰） | ✅ 完成（冒烟 178/0 + live 重启持久化实测） |
+| M3.7.1 | 模型管理弹框再重设计（用户否掉 M3.7 版）：主从两栏（左栏供应商导航·绿点呼吸标识·停用置灰 / 右栏详情+模型单选列表）；交互自解释删教学文案；操作按钮常驻右栏顶部；头部显示「当前使用 ×× · 模型」；新增 scripts/check-bundle-cjk.py 固化 bundle CJK 校验法（大写 \uXXXX 转义） | ✅ 完成（构建 + bundle 校验 ALL PASS + live 数据核对；浏览器观感待用户确认） |
+| M3.8 | 网关 max_tokens 钳制（宝云 400 修复）：runtime `_max_tokens_for(base_url)` 按网关钳 131072（DSH 默认 256000 被网关拒）；DeepSeekHarness 构造传 max_tokens；探测 body 同步带钳制值（保真第三件事）；diag-max-tokens.py 五档边界实测定位根因 | ✅ 完成（冒烟 182/0 + live 修复前后对比：报错 → 正常回答） |
+| M3.9 | DSH 会话碰撞修复 + 需求解析 AI-first：runtime 逻辑/物理会话 ID 隔离（代际映射，重建后新物理 ID 不撞旧 .dsh-sessions 日志）；orchestrator 阶段 0 无条件规则分析 → requirement-analyst AI 先行，规则仅在 Agent 两次失败时显式离线保底（活动流标「模型未参与」）；报告收尾用流水线实际产物重建落盘（报告与 DB 一致，不再先写规则快照）；reporter 置信度访问容错 | ✅ 完成（冒烟 193/0 + live `/api/chat/stream` 同 conversation_id 不再 collision、model_error: null；live 建任务活动流首阶段为 requirement-analyst 而非 rule-analysis） |
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
@@ -175,29 +176,57 @@ def main() -> int:
     # 里写给模型的规则；代码侧只有「DSH 真不可用时」的极简兜底。本冒烟环境无 DSH，
     # 验证兜底分支 + 注册表 prompt 含问候规则。
     print("[10] 路由（兜底分支 + 规则入 prompt）")
-    c1 = classify("你好")
+    # 本冒烟环境可能 DSH 在线（node 载体已构建 + 源码可用 → classify 直连模型）。
+    # 验证「兜底分支」必须强制 DSH 不可用，否则模型真实回答会让 reason 不含「启发式」。
+    import app.services.router as _rt10
+    _orig10 = _rt10.dsh_manager.run_turn
+    _rt10.dsh_manager.run_turn = lambda p, session_id=None, on_event=None: {
+        "status": "fallback", "message": "DSH 未就绪（冒烟强制兜底）"}
+    try:
+        c1 = classify("你好")
+    finally:
+        _rt10.dsh_manager.run_turn = _orig10
     check("「你好」兜底 → qa（不进流水线）", c1["intent"] == "qa")
     check("兜底 reason 显式标注启发式", "启发式" in c1.get("reason", ""), f"got {c1.get('reason')!r}")
     check("「你好，我要分析登录需求」兜底 → analyze（不误伤）",
           classify("你好，我要分析登录需求")["intent"] == "analyze")
     check("「全流程…生成报告」兜底 → full", classify("帮我全流程跑一遍生成报告")["intent"] == "full")
+    # 2026-09-01：句中问号/疑问词也视为问句（实测「…结论如何？一句话概括」
+    # 曾被 endswith 漏判成 analyze，追问被错建分析任务）
+    check("句中问号兜底 → qa（追问不误建任务）",
+          classify("刚才那个分析任务结论如何？一句话概括")["intent"] == "qa")
+    check("疑问词兜底 → qa", classify("如何设计幂等用例")["intent"] == "qa")
+    check("无问句特征兜底 → analyze（不误伤）",
+          classify("帮我把这个需求结构化分析一下")["intent"] == "analyze")
     a1 = qa_answer("你好")
     # DSH 在线时返回模型真实回答；离线时回退到 _OFFLINE_REPLY。两种环境都合法，
     # 关键不变式：绝不静默空答（至少给一句话），且离线时显式声明未调用 AI。
     check("问答回答非空（在线=模型答 / 离线=能力引导）", bool(a1 and a1.strip()), f"got {a1[:60]!r}")
-    # 离线分支确定性验证：打桩让 run_turn 返回 error，qa_answer 必须落到 _OFFLINE_REPLY
+    # 错误分支确定性验证（打桩，2026-09-01 修复「模型未返回内容」黑盒）：
+    # 模型被调了但报错（404/配额/超时）→ 回答说真因 + model_error 信号；
+    # 只有 DSH Runtime 真没起来（fallback）才落到「未调用 AI」能力引导。
     import app.services.router as _rt
     _orig_qa = _rt.dsh_manager.run_turn
-    _rt.dsh_manager.run_turn = lambda p, session_id=None, on_event=None: {"status": "error"}
+    _rt.dsh_manager.run_turn = lambda p, session_id=None, on_event=None: {
+        "status": "error", "message": "DeepSeek API error (HTTP 404)"}
+    try:
+        qr = _rt.qa_answer_result("你好")
+    finally:
+        _rt.dsh_manager.run_turn = _orig_qa
+    check("模型报错时回答含真因（404）", "404" in qr["answer"], f"got {qr['answer'][:60]!r}")
+    check("模型报错透出 model_error 信号", bool(qr["model_error"]), f"got {qr['model_error']!r}")
+    _rt.dsh_manager.run_turn = lambda p, session_id=None, on_event=None: {
+        "status": "fallback", "message": "DSH 未就绪"}
     try:
         a_offline = _rt.qa_answer("你好")
     finally:
         _rt.dsh_manager.run_turn = _orig_qa
-    check("离线兜底明说未调用 AI", ("未调用 AI" in a_offline) or ("未就绪" in a_offline),
+    check("DSH 未就绪兜底明说未调用 AI", "未调用 AI" in a_offline,
           f"got {a_offline[:60]!r}")
     # 注册表：规则长在 prompt/skill 里
     ic = reg.get_agent("intent-classifier")
     check("intent-classifier prompt 含问候规则", "问候" in ic.system_prompt)
+    check("intent-classifier prompt 消歧「问结论=qa」", "问结论" in ic.system_prompt)
     check("intent-classifier 挂 routing-rules skill", getattr(ic, "skill", None) == "routing-rules")
     qa = reg.get_agent("qa-assistant")
     check("qa-assistant prompt 含问候回应规则", "问候" in qa.system_prompt)
@@ -357,6 +386,9 @@ def main() -> int:
     # /agent_sessions/dsh_events）。delete_task 正交清七表。
     print("[16] 会话删除（级联消息 + 任务 + 衍生数据）")
     from app.db import entities as E2
+    from app.db.engine import init_schema
+
+    init_schema()  # 建表幂等（含 [23] 的 app_settings；表已存在则跳过）
     _now = E2._now  # noqa: SLF001 — 复用 entities 的时间戳生成
     # 建一个有消息+有任务的会话
     cid = E2.create_conversation("删除测试会话")
@@ -410,6 +442,462 @@ def main() -> int:
     check("delete_task 清任务行", E2.get_task(tid2) is None)
     ok2 = E2.delete_task("never-existed")
     check("delete_task 删不存在返回 False", ok2 is False)
+
+    # ── 17. 项目传参：选了项目，问答/意图也要带上（2026-08-27）──
+    # 用户报「选了项目传参不带，怎么基于哪个项目提问」。修复：前端把 selProjects
+    # 透传到 /api/chat，后端 classify/qa_answer 都接 projects 参数，并注入
+    # 「用户选定的目标项目」段到提示词，让模型把回答落到具体项目上。
+    print("[17] 项目传参（classify/qa_answer 注入目标项目）")
+    import app.services.router as rt2
+    seen_p2: list[str] = []
+
+    def fake_proj(prompt, session_id=None, on_event=None):
+        seen_p2.append(prompt)
+        return {"status": "ok",
+                "final_response": '{"intent":"qa","confidence":0.9,"reason":"项目问答"}',
+                "finish_reason": "stop"}
+
+    orig2 = rt2.dsh_manager.run_turn
+    rt2.dsh_manager.run_turn = fake_proj
+    try:
+        rt2.classify("这个项目怎么测", projects=["customer-core", "admin-core"])
+        rt2.qa_answer("这个项目怎么测", projects=["customer-core"])
+        rt2.classify("你好")  # 不带项目 → 注入块应为空
+    finally:
+        rt2.dsh_manager.run_turn = orig2
+    check("classify 带 projects 时提示词含目标项目",
+          "目标项目" in seen_p2[0] and "customer-core" in seen_p2[0],
+          f"got {seen_p2[0][-120:]!r}")
+    check("qa_answer 带 projects 时提示词含目标项目",
+          "目标项目" in seen_p2[1] and "customer-core" in seen_p2[1],
+          f"got {seen_p2[1][-120:]!r}")
+    check("无 projects 时不注入目标项目段",
+          "目标项目" not in seen_p2[2], f"got {seen_p2[2][-120:]!r}")
+
+    # /api/chat 端点签名接 projects 并回传
+    from app.api import requirements as api_req
+    import inspect
+    sig = inspect.signature(api_req.chat)
+    check("/api/chat 签名含 projects 参数", "projects" in sig.parameters,
+          f"got params={list(sig.parameters)}")
+
+    # ── 18. 问答流式 + 附件并入提问（2026-08-27 第二轮）──
+    # ① qa_answer(on_delta=...) 收 DSH assistant/message 事件文本段；
+    # ② /api/chat 文本附件内容并入提问（附件-only 不再被整包丢弃）；
+    # ③ /api/chat/stream SSE 端点存在且签名含同参数。
+    print("[18] 问答流式 + 附件并入提问")
+    seen_events: list[dict] = []
+
+    def fake_stream(prompt, session_id=None, on_event=None):
+        seen_events.append({"prompt": prompt, "has_cb": on_event is not None})
+        # 模拟 DSH 推两段 assistant/message
+        if on_event is not None:
+            on_event({"type": "assistant/message", "data": {"message": {
+                "content": [{"type": "text", "text": "登录测试建议："}]}}})
+            on_event({"type": "assistant/message", "data": {"message": {
+                "content": [{"type": "text", "text": "覆盖五种登录方式与锁定。"}]}}})
+            on_event({"type": "tool/call", "data": {"name": "grep"}})  # 非文本事件应被忽略
+        return {"status": "ok", "final_response": "登录测试建议：覆盖五种登录方式与锁定。",
+                "finish_reason": "stop"}
+
+    orig3 = rt2.dsh_manager.run_turn
+    rt2.dsh_manager.run_turn = fake_stream
+    deltas: list[str] = []
+    try:
+        ans = rt2.qa_answer("怎么测登录", projects=["customer-core"],
+                            on_delta=lambda c: deltas.append(c))
+    finally:
+        rt2.dsh_manager.run_turn = orig3
+    check("qa_answer on_delta 收到 2 段文本", len(deltas) == 2, f"got {deltas}")
+    check("qa_answer on_delta 过滤非文本事件", all("grep" not in d for d in deltas))
+    check("qa_answer 流式回调不影响最终回答", "登录测试" in ans, f"got {ans[:50]!r}")
+    check("qa_answer 无回调时等价于普通回合", seen_events[0]["has_cb"] is True)
+
+    sig2 = inspect.signature(api_req.chat)
+    check("/api/chat 签名含 attachments 参数", "attachments" in sig2.parameters,
+          f"got params={list(sig2.parameters)}")
+    check("/api/chat/stream 端点已注册", hasattr(api_req, "chat_stream"))
+
+    # ── 19. 输入保真：chat_stream 也接 attachments；文本附件合并逻辑统一 ──
+    # （2026-08-30：用户报「再检查一遍输入场景的失真」——chat_stream 此前
+    # 完全不接 attachments，前端走流式主链路时附件整包丢失。）
+    print("[19] 输入保真（chat_stream 附件 + 合并函数）")
+    sig3 = inspect.signature(api_req.chat_stream)
+    check("/api/chat/stream 签名含 attachments 参数", "attachments" in sig3.parameters,
+          f"got params={list(sig3.parameters)}")
+
+    import asyncio as _asyncio
+
+    # _merge_text_attachments：文本附件并入、二进制计数、截断上限
+    class _FakeUpload:
+        def __init__(self, filename: str, data):
+            self.filename = filename
+            self._data = data
+
+        async def read(self):
+            return self._data
+
+    merge = api_req._merge_text_attachments
+    t1, b1 = _asyncio.run(merge("帮我分析", [
+        _FakeUpload("req.md", "需求：登录锁定规则".encode("utf-8"))]))
+    check("文本附件内容并入提问", "需求：登录锁定规则" in t1 and t1.startswith("帮我分析"), f"got {t1!r}")
+    check("文本附件二进制计数为 0", b1 == 0)
+    t2, b2 = _asyncio.run(merge("", [_FakeUpload("shot.png", b"\x89PNG" + b"\x00" * 8)]))
+    check("纯图片附件：文本为空、计数 1", t2 == "" and b2 == 1, f"got {t2!r}, {b2}")
+    t3, b3 = _asyncio.run(merge("看下这个", [
+        _FakeUpload("a.txt", b"x" * 9000)]))
+    check("文本附件超长截断到 4000", len(t3.split("[附件 a.txt]\n", 1)[1]) == 4000, f"got {len(t3)}")
+    check("文本+图片混合：图片计数 1", b3 == 0)
+    t4, b4 = _asyncio.run(merge("", [
+        _FakeUpload("a.md", "A".encode("utf-8")),
+        _FakeUpload("b.png", b"\x89PNG"),
+        _FakeUpload("c.txt", "C".encode("utf-8"))]))
+    check("多附件按类型分流（文本并入、图片计数）",
+          "A" in t4 and "C" in t4 and b4 == 1, f"got {t4!r}, {b4}")
+
+    # ── 20. Agent 间上下文传递（digest 保真：显式截断 + 证据带原文） ──────
+    # （2026-08-31：用户要求「优化输入+输出整个流程」——审查发现三处失真：
+    #  ① requirement digest limit=12 静默丢第 13+ 条需求；② evidence digest
+    #  不带 snippet（审查 Agent 拿不到代码原文）；③ call-chain/test-designer/
+    #  quality-judge 缺上游产物输入。本节验证 digest 层的行为。）
+    print("[20] Agent 间上下文传递（digest 保真）")
+    from app.services.orchestrator import _requirement_digest as _rd, _evidence_digest as _ed
+
+    many = [{"id": f"REQ-{i:03d}", "title": f"需求{i}", "priority": "P1",
+             "description": "描述", "acceptance_criteria": ["验收"]} for i in range(1, 16)]
+    d15 = _rd(many)
+    check("digest 超 12 条显式注明溢出", "另有 3 条需求未列出" in d15, f"got tail {d15[-80:]!r}")
+    check("digest 溢出标注含后续起点 ID", "REQ-013" in d15)
+    d8 = _rd(many[:8])
+    check("digest 未溢出无标注", "未列出" not in d8)
+    d12 = _rd(many[:12])
+    check("digest 恰好 12 条无标注（边界）", "未列出" not in d12 and "REQ-012" in d12)
+
+    evs = [{"project": "core", "path": "src/Login.java", "line": 5, "symbol": "checkPwd",
+            "confidence": 0.9, "summary": "if (errorNum >= 4) { lock(60); }"},
+           {"project": "core", "path": "src/A.java", "line": 1, "symbol": "",
+            "confidence": 0.5, "summary": ""}]
+    ed = _ed(evs)
+    check("证据 digest 带代码原文片段", "errorNum >= 4" in ed, f"got {ed!r}")
+    check("证据 digest 空 snippet 不留悬挂标注", "代码：" not in ed.split("src/A.java")[1][:40])
+    ed20 = _ed([{"project": "p", "path": f"f{i}.java", "line": i, "symbol": "",
+                 "confidence": 0.5, "summary": "x"} for i in range(20)])
+    check("证据 digest 超 15 条显式注明溢出", "另有 5 处证据未列出" in ed20)
+
+    # ── 21. 任务结论回写会话（输出侧记忆闭环：追问「刚才结论如何」有据可答） ──
+    print("[21] 任务结论回写会话")
+    from app.services.orchestrator import _notify_conversation as _notify
+    cid5 = E2.create_conversation("回写测试会话")
+    tid5 = "smoke-notify-task-001"
+    E2.engine.execute("DELETE FROM analysis_tasks WHERE task_id = ?", (tid5,))
+    E2.engine.insert(
+        "INSERT INTO analysis_tasks (task_id, title, source_text, projects, branch, "
+        "workspace, status, created_at, updated_at) VALUES (?, ?, '', '', '', '', 'completed', ?, ?)",
+        (tid5, "回写测试任务", _now(), _now()))
+    E2.save_message(cid5, "assistant", "已创建分析任务", intent="full", task_id=tid5)
+    check("反查任务所属会话（chat_messages.task_id）",
+          E2.find_conversation_of_task(tid5) == cid5)
+    _notify(tid5, "分析任务完成：3 条需求、5 处证据，高风险 1 条。可直接追问结论细节。")
+    msgs5 = E2.list_messages(cid5)
+    check("结论回写进会话消息流",
+          any("分析任务完成：3 条需求" in m["content"] for m in msgs5),
+          f"got {[m['content'][:30] for m in msgs5]}")
+    check("回写消息带 task_id 关联（前端渲染为可点击任务块）",
+          any(m.get("task_id") == tid5 and "分析任务完成" in m["content"] for m in msgs5))
+    _notify("no-such-task-anywhere", "不应写入")
+    check("无会话关联的任务回写静默跳过不崩", True)
+    E2.delete_conversation(cid5)
+
+    # ── 22. 模型级错误显式化（2026-09-01「模型未返回内容」黑盒修复） ──────
+    # SDK 的 run() 不因模型错误抛异常——404/配额/超时表现为 finish_reason=error
+    # + final_response=""，此前被当成 status=ok 返回空串，真因完全不可见。
+    print("[22] run_turn 模型错误显式化")
+    from app.dsh import runtime as dshrt
+
+    class FakeResult:
+        def __init__(self, final: str, finish: str, events: list):
+            self.session_id = "smoke-fake-session"
+            self.final_response = final
+            self.finish_reason = finish
+            self.events = events
+
+    ERR_EVENTS = [{"type": "turn/end", "data": {"reason": {
+        "kind": "error",
+        "error": {"message": "DeepSeek API error (HTTP 404)", "code": "HTTP_404", "status": 404}}}}]
+
+    class FakeHarness:
+        def __init__(self, result):
+            self._r = result
+
+        def run(self, prompt, session_id=None, on_notification=None):
+            return self._r
+
+    m22 = dshrt.manager
+    orig_h = m22._harness
+    m22._harness = FakeHarness(FakeResult("", "error", ERR_EVENTS))
+    try:
+        r22 = m22.run_turn("ping", session_id="smoke-err")
+        check("模型 404 → status=error（不再伪装 ok）",
+              r22.get("status") == "error", f"got {r22.get('status')!r}")
+        check("404 真因透出到 message", "404" in str(r22.get("message", "")),
+              f"got {r22.get('message')!r}")
+        m22._harness = FakeHarness(FakeResult("", "completed", []))
+        r22b = m22.run_turn("ping", session_id="smoke-err")
+        check("空 final_response（finish=completed）也判错误",
+              r22b.get("status") == "error", f"got {r22b.get('status')!r}")
+        m22._harness = FakeHarness(FakeResult("正常回答", "completed", []))
+        r22c = m22.run_turn("ping", session_id="smoke-err")
+        check("正常回答仍 status=ok",
+              r22c.get("status") == "ok" and r22c.get("final_response") == "正常回答",
+              f"got {r22c.get('status')!r}")
+    finally:
+        m22._harness = orig_h
+    # classify 的兜底 reason 说真话（不再一律「DSH 不可用」）
+    import app.services.router as rt22
+    orig22 = rt22.dsh_manager.run_turn
+    rt22.dsh_manager.run_turn = lambda p, session_id=None, on_event=None: {
+        "status": "error", "message": "DeepSeek API error (HTTP 404)"}
+    try:
+        r22d = rt22.classify("帮我分析登录需求")
+    finally:
+        rt22.dsh_manager.run_turn = orig22
+    check("classify 兜底 reason 标注模型调用失败真因",
+          "模型调用失败" in r22d.get("reason", "") and "404" in r22d.get("reason", ""),
+          f"got {r22d.get('reason')!r}")
+    # base_url 归一化：DSH 请求 {baseURL}/chat/completions，纯域名网关需补 /v1
+    nb = dshrt.manager._normalize_base_url
+    check("base_url 纯域名自动补 /v1",
+          nb("https://ai-api.baoyun.com") == "https://ai-api.baoyun.com/v1",
+          f"got {nb('https://ai-api.baoyun.com')!r}")
+    check("base_url 已带 /v1 保持原样",
+          nb("https://api.deepseek.com/v1") == "https://api.deepseek.com/v1")
+    check("base_url 自定义路径尊重原样",
+          nb("https://gw.example.com/api") == "https://gw.example.com/api")
+    check("base_url 尾斜杠清理后补 /v1",
+          nb("https://x.com/") == "https://x.com/v1")
+    # max_tokens 网关钳制（2026-09-02 宝云 400 修复）：DSH 默认 256000 超网关上限
+    mt = dshrt.manager._max_tokens_for
+    check("宝云网关 max_tokens 钳制 131072",
+          mt("https://ai-api.baoyun.com/v1") == 131072,
+          f"got {mt('https://ai-api.baoyun.com/v1')!r}")
+    check("官方 API 不钳制（保持 SDK 默认）",
+          mt("https://api.deepseek.com/v1") is None,
+          f"got {mt('https://api.deepseek.com/v1')!r}")
+    check("无 base_url 不钳制", mt(None) is None)
+    check("未知网关不钳制（不误伤）",
+          mt("https://gw.example.com/v1") is None)
+
+    # ── 23. 模型选型持久化（2026-09-01 修「重启后选型回默认」） ─────────────
+    # app_settings 键值对 + manager 懒加载/落库；reconfigure 支持 provider/model
+    # 分开换；_resolve_provider_config 优先用持久化的供应商×模型组合。
+    print("[23] 模型选型持久化")
+    from app.db import entities as E3
+
+    E3.set_setting("smoke_key", "smoke_value")
+    check("set/get_setting 读写一致", E3.get_setting("smoke_key") == "smoke_value")
+    E3.set_setting("smoke_key", "smoke_value_2")  # upsert 路径
+    check("set_setting 二次写入为更新（upsert）",
+          E3.get_setting("smoke_key") == "smoke_value_2")
+    check("get_setting 未设键返回默认", E3.get_setting("no_such_key", "dft") == "dft")
+    m23 = dshrt.manager
+    default_row = E3.get_default_model_config() or {}
+    def_key = default_row.get("provider_key")
+    def_model = (default_row.get("model_ids") or ["deepseek-v4-flash"])[0]
+    m23._selection_loaded = False
+    m23._preferred_provider_key = None
+    m23._preferred_model = None
+    m23._load_selection()
+    check("懒加载不崩且标记置位", m23._selection_loaded is True)
+    # reconfigure 只换模型（不换供应商）——changed 含 model。
+    # 强制清内存模型选择（懒加载可能已带出历史持久化值，使切换成 no-op）
+    m23.reconfigure(provider_key=def_key)  # 先固定供应商（清掉历史残留选择）
+    m23._preferred_model = None
+    out23 = m23.reconfigure(model=def_model)
+    check("reconfigure(model=...) changed 含 model", "model" in out23.get("changed", []),
+          f"got {out23.get('changed')}")
+    check("模型选择已持久化", E3.get_setting(m23.ACTIVE_MODEL_KEY) == def_model,
+          f"got {E3.get_setting(m23.ACTIVE_MODEL_KEY)!r}")
+    check("供应商选择未被模型切换覆盖",
+          E3.get_setting(m23.ACTIVE_PROVIDER_KEY) == def_key)
+    # 新进程模拟：清内存重载应恢复持久化选择
+    m23._selection_loaded = False
+    m23._preferred_provider_key = None
+    m23._preferred_model = None
+    m23._load_selection()
+    check("重启模拟：懒加载恢复持久化模型", m23._preferred_model == def_model,
+          f"got {m23._preferred_model!r}")
+    check("重启模拟：懒加载恢复持久化供应商", m23._preferred_provider_key == def_key,
+          f"got {m23._preferred_provider_key!r}")
+    # 换供应商时模型不在新目录 → 清掉由目录首个顶上（_resolve 校正）。
+    # 不硬编码供应商名（环境相关）：从 DB 取一个 ≠ 当前的启用配置。
+    all_cfgs = E3.list_model_configs()
+    other = next((c for c in all_cfgs if c.get("enabled") and c.get("provider_key") != def_key), None)
+    if other is not None:
+        m23.reconfigure(provider_key=other["provider_key"])
+        cfg23 = m23._resolve_provider_config() or {}
+        check("换供应商后模型回落该供应商目录首个",
+              cfg23.get("model_id") == (other.get("model_ids") or [None])[0],
+              f"got {cfg23.get('model_id')!r}")
+        check("选中供应商已持久化",
+              E3.get_setting(m23.ACTIVE_PROVIDER_KEY) == other["provider_key"])
+    else:
+        check("（环境仅一个供应商，跳过换供应商分支）", True)
+    # 还原：切回默认配置 + 其首个模型
+    m23.reconfigure(provider_key=def_key, model=(default_row.get("model_ids") or [None])[0])
+    cfg23b = m23._resolve_provider_config() or {}
+    check("还原默认后解析回默认模型",
+          cfg23b.get("model_id") == (default_row.get("model_ids") or [None])[0],
+          f"got {cfg23b.get('model_id')!r}")
+
+    # ── 24. DSH 会话物理 ID 隔离（2026-09-02 修 persisted log collision） ────
+    # 后端重启/Runtime 重建后，若仍用同一逻辑 ID 新建 live session，DSH
+    # persistence coordinator 会拒绝（旧日志 seed 不匹配）。Runtime 内部把
+    # 逻辑 ID 映射成 runtime-scoped 物理 ID：同代际同逻辑→同物理（多轮上下文
+    # 保留）；stop/重建后代际变更→新物理 ID，不再撞旧 .dsh-sessions 日志。
+    print("[24] DSH 会话物理 ID 隔离")
+    from app.dsh import runtime as dshrt24
+
+    m24 = dshrt24.manager
+    # 捕获 run_turn 喂给 SDK 的物理 session_id（打桩 harness.run）
+    seen_pids: list[str | None] = []
+
+    class FakeHarness24:
+        def __init__(self):
+            self.session_counter = 0
+
+        def run(self, prompt, session_id=None, on_notification=None):
+            seen_pids.append(session_id)
+            sid = session_id or f"fake-{self.session_counter}"
+
+            class R:
+                pass
+            r = R()
+            r.session_id = sid
+            r.final_response = "ok"
+            r.finish_reason = "completed"
+            r.events = []
+            self.session_counter += 1
+            return r
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    orig_h24 = m24._harness
+    orig_gen24 = m24._runtime_gen
+    orig_map24 = m24._session_map
+    m24._harness = None  # 强制走 start() 路径生成新代际
+    # 注入 fake harness：跳过真实 start()，直接置入并模拟代际生成
+    m24._harness = FakeHarness24()
+    m24._runtime_gen = "gen1aaa"
+    m24._session_map = {}
+    try:
+        logical = "conv-41ee56477b10--qa"
+        # 同一代际、同一逻辑 ID 两次调用 → 同一物理 ID（多轮上下文保留）
+        m24.run_turn("ping", session_id=logical)
+        m24.run_turn("ping2", session_id=logical)
+        check("同代际同逻辑→同物理 ID（多轮稳定）",
+              seen_pids[0] == seen_pids[1] and seen_pids[0] is not None,
+              f"got {seen_pids[:2]}")
+        check("物理 ID ≠ 逻辑 ID（不撞业务 ID 旧日志）",
+              seen_pids[0] != logical, f"got {seen_pids[0]!r}")
+        check("物理 ID 带代际前缀 r{gen}",
+              seen_pids[0].startswith("rgen1aaa-"), f"got {seen_pids[0]!r}")
+        # 不同逻辑 ID → 不同物理 ID（intent/qa 隔离）
+        m24.run_turn("ping", session_id="conv-41ee56477b10--intent")
+        check("不同逻辑→不同物理 ID（intent/qa 隔离）",
+              seen_pids[2] != seen_pids[0], f"got intent={seen_pids[2]!r} qa={seen_pids[0]!r}")
+        # 模拟 Runtime 重建（stop/异常）：代际变更 → 新物理 ID，不撞旧日志
+        m24.stop()  # 清代际与映射
+        m24._harness = FakeHarness24()
+        m24._runtime_gen = "gen2bbb"
+        m24._session_map = {}
+        m24.run_turn("ping", session_id=logical)
+        check("重建后同逻辑→新物理 ID（不再撞旧持久化日志）",
+              seen_pids[3] != seen_pids[0], f"got old={seen_pids[0]!r} new={seen_pids[3]!r}")
+        check("新物理 ID 带新代际前缀",
+              seen_pids[3].startswith("rgen2bbb-"), f"got {seen_pids[3]!r}")
+        # 无 session_id → 透传 None（沿用 SDK 原有随机行为，不强行映射）
+        m24.run_turn("one-shot")
+        check("无逻辑 ID → 透传 None（SDK 随机 session）",
+              seen_pids[4] is None, f"got {seen_pids[4]!r}")
+    finally:
+        m24._harness = orig_h24
+        m24._runtime_gen = orig_gen24
+        m24._session_map = orig_map24
+
+    # ── 25. AI-first 编排：requirement-analyst 成功时不跑规则分析 ──────────
+    # 2026-09-02 调整：文档语义由 AI 处理，规则只在 Agent 拿不到结构化需求时保底。
+    # 打桩 _run_agent 成功 → 不应调用 _run_rule_analysis / NavigatorAnalyzer。
+    print("[25] AI-first 编排（Agent 成功不跑规则分析）")
+    from app.services import orchestrator as orch25
+    import app.services.router as rt25
+
+    seen_rule: list[str] = []
+
+    def fake_run_agent_ok(task_id, agent_id, payload, items=None):
+        class S:
+            pass
+        class VR:
+            def summary(self): return "ok"
+            def __init__(self): self.repaired = 0; self.dropped = 0; self.total = 2; self.valid = 2
+        items_out = [{"id": "REQ-001", "title": "AI 拆的需求", "description": "AI 结构化",
+                       "priority": "P1", "acceptance_criteria": ["验收1"]},
+                      {"id": "REQ-002", "title": "第二条", "description": "d",
+                       "priority": "P2", "acceptance_criteria": []}]
+        return items_out, {"final_response": "..."}, VR()
+
+    orig_ra = orch25._run_agent
+    orig_rule = orch25._run_rule_analysis
+    orig_rt25 = rt25.dsh_manager.run_turn
+    # /tasks 端点用 router.classify，但 _run_task 直接用 _run_agent/_run_rule_analysis
+    orch25._run_agent = fake_run_agent_ok
+    def fake_rule(*a, **kw):
+        seen_rule.append("called")
+        raise AssertionError("规则分析不应在 AI 成功时执行")
+    orch25._run_rule_analysis = fake_rule
+    # 让后续 project-scout 等阶段也走 fake（避免真实 DSH 调用）
+    def fake_agent_any(task_id, agent_id, payload, items=None):
+        return [], {"final_response": ""}, ValidationReport()
+    # 只让 requirement-analyst 走 ok 路径，其余阶段返回空（跳过）
+    def dispatch(task_id, agent_id, payload, items=None):
+        if agent_id == "requirement-analyst":
+            return fake_run_agent_ok(task_id, agent_id, payload, items)
+        return [], {"final_response": ""}, ValidationReport()
+    orch25._run_agent = dispatch
+    try:
+        tid25 = f"smoke-aifirst-{uuid4().hex[:6]}"
+        from app.db import entities as E25
+        from app.db.engine import init_schema
+        init_schema()
+        E25.engine.execute("DELETE FROM analysis_tasks WHERE task_id = ?", (tid25,))
+        E25.engine.insert(
+            "INSERT INTO analysis_tasks (task_id, title, source_text, projects, branch, "
+            "workspace, status, created_at, updated_at) VALUES (?, ?, ?, '', '', '', 'pending', ?, ?)",
+            (tid25, "AI-first 测试", "一些需求文本", _now(), _now()))
+        orch25._run_task(tid25, "analyze")
+        check("AI 成功时不执行 _run_rule_analysis", seen_rule == [],
+              f"规则分析被调用 {len(seen_rule)} 次")
+        task25 = E25.get_task(tid25)
+        check("AI 成功路径产出了报告 ID", bool(task25.get("report_id")),
+              f"got {task25.get('report_id')!r}")
+        reqs25 = E25.list_requirements(tid25)
+        check("需求来自 AI（requirement-analyst），非规则拆分",
+              any(r.get("title") == "AI 拆的需求" for r in reqs25),
+              f"got {[r.get('title') for r in reqs25]}")
+        # 活动流应显示 AI 需求分析，而非「规则分析」作为主路径
+        acts = orch25.activity_items(tid25)
+        stages = [a.get("stage") for a in acts if a.get("stage")]
+        check("活动流无 rule-analysis 作为首阶段", "rule-analysis" not in stages[:1],
+              f"got stages={stages}")
+    finally:
+        orch25._run_agent = orig_ra
+        orch25._run_rule_analysis = orig_rule
+        rt25.dsh_manager.run_turn = orig_rt25
+
+    print(f"\n结果：{PASS} PASS / {FAIL} FAIL")
 
     print(f"\n结果：{PASS} PASS / {FAIL} FAIL")
     return 1 if FAIL else 0

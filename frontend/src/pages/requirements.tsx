@@ -1,7 +1,7 @@
 import React from 'react'
-import { getJson, postForm, postJson, streamSse, delJson } from '../api'
+import { getJson, postForm, streamSse, postFormSse, delJson, patchForm } from '../api'
 import { ModelModal } from '../components/ModelDrawer'
-import { toast as showToast, Icon } from '../components/ui'
+import { toast as showToast } from '../components/ui'
 
 /* ── 类型 ──────────────────────────────────────────────────────────── */
 interface TaskItem {
@@ -13,6 +13,8 @@ interface ConvItem { conv_id: string; title: string; created_at: string; updated
 interface ConvMessage {
   role: string; content: string; intent?: string | null; task_id?: string | null
   created_at: string
+  /** 模型被调了但失败（404/配额/超时等）——气泡展示错误样式 + 重试入口 */
+  model_error?: string | null
 }
 interface ActItem {
   seq: number; time: string; agent: string; agent_name: string; kind: string
@@ -38,6 +40,7 @@ const PRIORITY_CLS: Record<string, string> = { P0: 'bad', P1: 'warn', P2: 'neutr
 const RISK_CLS: Record<string, string> = { high: 'bad', medium: 'warn', low: 'ok' }
 const VERDICT_CLS: Record<string, string> = { pass: 'ok', fail: 'bad', blocked: 'bad', needs_review: 'warn' }
 const STATUS_CLS: Record<string, string> = { completed: 'ok', failed: 'bad', running: 'warn', pending: 'neutral' }
+const MODE_LABEL: Record<string, string> = { auto: '自动识别', qa: '问答', analyze: '需求分析', full: '全流程+报告' }
 
 /** 流程轨道：8 Agent（id → 图标/短名/全名）。 */
 const RAIL: Array<{ id: string; icon: string; short: string }> = [
@@ -87,51 +90,82 @@ function fileSize(n: number): string {
 }
 
 
-/* ── 项目多选下拉 ───────────────────────────────────────────────────── */
-function ProjectMultiSelect({ options, value, onChange }: {
+/* ── 会话时间分组：今天 / 昨天 / 近 7 天 / 更早 ─────────────────────── */
+function groupConvs(convs: ConvItem[]): Array<[string, ConvItem[]]> {
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  const yest = new Date(today); yest.setDate(yest.getDate() - 1)
+  const week = new Date(today); week.setDate(week.getDate() - 7)
+  const groups: Array<[string, ConvItem[]]> = [['今天', []], ['昨天', []], ['近 7 天', []], ['更早', []]]
+  const byKey: Record<string, ConvItem[]> = Object.fromEntries(groups)
+  for (const c of convs) {
+    const d = new Date((c.updated_at || '').replace(' ', 'T'))
+    if (isNaN(d.getTime())) { byKey['更早'].push(c); continue }
+    if (d >= today) byKey['今天'].push(c)
+    else if (d >= yest) byKey['昨天'].push(c)
+    else if (d >= week) byKey['近 7 天'].push(c)
+    else byKey['更早'].push(c)
+  }
+  return groups.filter(([, items]) => items.length > 0)
+}
+
+
+/* ── 项目选择 chip + 弹层（多选 + 高级选项收进弹层底部） ────────────── */
+function ProjectPicker({ options, value, onChange, workspace, branch,
+  onWorkspace, onBranch }: {
   options: ProjectOption[]; value: string[]; onChange: (v: string[]) => void
+  workspace: string; branch: string
+  onWorkspace: (v: string) => void; onBranch: (v: string) => void
 }) {
   const [open, setOpen] = React.useState(false)
   const [q, setQ] = React.useState('')
+  const [advOpen, setAdvOpen] = React.useState(false)
   const ref = React.useRef<HTMLDivElement>(null)
   React.useEffect(() => {
+    if (!open) return
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
-  }, [])
+  }, [open])
   const kw = q.trim().toLowerCase()
   const filtered = kw ? options.filter(o => o.name.toLowerCase().includes(kw)) : options
-  const toggle = (n: string) => onChange(value.includes(n) ? value.filter(x => x !== n) : [...value, n])
+  const label = value.length === 0 ? '自动侦察'
+    : value.length === 1 ? value[0] : `${value[0]} 等 ${value.length} 个`
   return (
-    <div className="msel" ref={ref} style={{ flex: 1, minWidth: 260 }}>
-      <div className="msel-box" onClick={() => setOpen(o => !o)}>
-        {value.length === 0
-          ? <span className="ph">目标项目（可多选，留空由侦察 Agent 自动判断）</span>
-          : value.map(v => (
-            <span key={v} className="chip">{v}
-              <i onClick={e => { e.stopPropagation(); toggle(v) }}>×</i>
-            </span>
-          ))}
-        <span className="msel-arrow">{open ? '▲' : '▼'}</span>
-      </div>
+    <div className="cx-pick" ref={ref}>
+      <button className={`cx-chip ${value.length ? 'on' : ''}`} onClick={() => setOpen(o => !o)}
+        title={value.length ? `已选项目：${value.join('、')}` : '不选则由侦察 Agent 自动判断涉及项目'}>
+        🗂 {label} <span className="cx-caret">▾</span>
+      </button>
       {open && (
-        <div className="msel-panel">
-          <input className="msel-search" placeholder="搜索项目名..." value={q}
-            onChange={e => setQ(e.target.value)} onClick={e => e.stopPropagation()} autoFocus />
-          <div className="msel-list">
+        <div className="pop">
+          <input className="pop-search" placeholder="搜索项目名..." value={q}
+            onChange={e => setQ(e.target.value)} autoFocus />
+          <div className="pop-list">
             {options.length === 0 ? <div className="empty">工作区下未发现项目目录</div> :
               filtered.length === 0 ? <div className="empty">无匹配项目</div> :
                 filtered.map(o => (
-                  <label key={o.name} className="msel-item" onClick={e => { e.preventDefault(); toggle(o.name) }}>
-                    <input type="checkbox" checked={value.includes(o.name)} onChange={() => toggle(o.name)} />
+                  <label key={o.name} className="pop-item">
+                    <input type="checkbox" checked={value.includes(o.name)}
+                      onChange={() => onChange(value.includes(o.name) ? value.filter(x => x !== o.name) : [...value, o.name])} />
                     <span>{o.name}</span>
                     {o.is_git && o.branch ? <span className="hint">{o.branch}</span> : null}
                   </label>
                 ))}
           </div>
-          <div className="msel-foot">
-            <button className="link" onClick={e => { e.stopPropagation(); onChange([]) }}>清空</button>
+          <div className="pop-foot">
+            <button className="link" onClick={() => onChange([])}>清空</button>
             <span className="hint">已选 {value.length} / {options.length}</span>
+          </div>
+          <div className="pop-adv">
+            <button className="link" onClick={() => setAdvOpen(o => !o)}>
+              {advOpen ? '收起高级选项 ▲' : '工作区 / 分支 ▼'}
+            </button>
+            {advOpen && (
+              <div className="pop-adv-form">
+                <div><label>源码工作区</label><input value={workspace} onChange={e => onWorkspace(e.target.value)} /></div>
+                <div><label>分支</label><input value={branch} onChange={e => onBranch(e.target.value)} /></div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -140,13 +174,46 @@ function ProjectMultiSelect({ options, value, onChange }: {
 }
 
 
-/* ── 模型激活条（点击打开模型管理抽屉） ─────────────────────────────── */
-function ModelBar({ currentModel, onOpen }: {
-  currentModel?: string; onOpen: () => void
+/* ── 模式选择 chip + 弹层（单选） ──────────────────────────────────── */
+function ModePicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = React.useState(false)
+  const ref = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  return (
+    <div className="cx-pick" ref={ref}>
+      <button className={`cx-chip ${value !== 'auto' ? 'on' : ''}`} onClick={() => setOpen(o => !o)}
+        title="自动识别：由意图分类 Agent 判断每条输入">
+        🎯 {MODE_LABEL[value] ?? value} <span className="cx-caret">▾</span>
+      </button>
+      {open && (
+        <div className="pop">
+          {(['auto', 'qa', 'analyze', 'full'] as const).map(m => (
+            <div key={m} className={`pop-item sel-row ${value === m ? 'sel' : ''}`}
+              onClick={() => { onChange(m); setOpen(false) }}>
+              <span>{MODE_LABEL[m]}</span>
+              {m === 'auto' ? <span className="hint">模型判断</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+/* ── 模型激活条（点击打开模型管理抽屉；圆点反映 DSH 状态） ──────────── */
+function ModelBar({ currentModel, onOpen, ok }: {
+  currentModel?: string; onOpen: () => void; ok?: boolean
 }) {
   return (
-    <button className="model-bar" onClick={onOpen} title="点击管理并切换模型">
-      <span className="model-dot" />
+    <button className="model-bar" onClick={onOpen}
+      title={ok === false ? 'DSH 引擎待验证——点击管理并配置模型' : '点击管理并切换模型'}>
+      <span className={`model-dot ${ok === false ? 'warn' : ''}`} />
       <span className="model-name">{currentModel || '选择模型'}</span>
       <span className="model-cfg">⚙</span>
     </button>
@@ -421,7 +488,14 @@ function ResultPanel({ a }: { a: Analysis }) {
 
 
 /* ── 主页面 ────────────────────────────────────────────────────────── */
-const MODE_LABEL: Record<string, string> = { auto: '自动识别', qa: '问答', analyze: '需求分析', full: '全流程+报告' }
+
+/** 欢迎页示例（点击只填入输入框，不自动发送）。 */
+const EXAMPLES: Array<[string, string, string]> = [
+  ['📋', '分析登录需求', '帮我分析一个登录需求：手机号+验证码登录，连续输错 5 次锁定 60 分钟'],
+  ['🔍', '基于项目提问', '这个项目的登录逻辑该怎么测？'],
+  ['📝', '全流程出报告', '分析上面的需求并生成测试报告'],
+  ['💬', '测试方法论', '幂等性测试怎么设计用例？'],
+]
 
 export function RequirementsPage() {
   // 基础数据
@@ -445,19 +519,20 @@ export function RequirementsPage() {
   const [branch, setBranch] = React.useState('')
   const [files, setFiles] = React.useState<File[]>([])  // 粘贴/拖拽的附件
   const [dragOver, setDragOver] = React.useState(false)
-  const [advOpen, setAdvOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
   const [formErr, setFormErr] = React.useState('')
   const [mode, setMode] = React.useState<string>('auto')
-  const [qaMsg, setQaMsg] = React.useState<{ q: string; a: string } | null>(null)
   const [detected, setDetected] = React.useState('')
   const [intentReason, setIntentReason] = React.useState('')
+  const [editingId, setEditingId] = React.useState('')  // 正在重命名的会话 id（双击进入）
 
   const msgsRef = React.useRef<HTMLDivElement>(null)
   const inputRef = React.useRef<HTMLTextAreaElement>(null)
+  const fileRef = React.useRef<HTMLInputElement>(null)
   const composerRef = React.useRef<HTMLDivElement>(null)
   const stickRef = React.useRef(true)
   const doneRef = React.useRef(false)
+  const streamingRef = React.useRef(false)  // 问答流进行中（finish 时勿刷新消息列表防打断）
 
   const showToastMsg = (msg: string) => showToast(msg, 'info')
 
@@ -483,6 +558,14 @@ export function RequirementsPage() {
     if (stickRef.current && msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight
   }, [acts, analysis, messages])
 
+  // composer textarea 自动长高（2 行起步，最高 200px）
+  React.useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+  }, [text])
+
   function loadAnalysis(id: string) {
     getJson<Analysis>(`/api/requirements/tasks/${id}/analysis`).then(d => {
       setAnalysis(d)
@@ -502,6 +585,12 @@ export function RequirementsPage() {
     setBusy(false)
     loadAnalysis(id)
     refreshHistory()
+    // 任务结论已由后端回写会话（_notify_conversation）——空闲时同步消息流，
+    // 让「分析任务完成」任务块出现在当前会话；问答流进行中则跳过（防覆盖流式气泡）
+    if (convId && !streamingRef.current) {
+      getJson<{ messages: ConvMessage[] }>(`/api/conversations/${convId}/messages`)
+        .then(d => { if (d.messages?.length) setMessages(d.messages) }).catch(() => {})
+    }
     getJson<TaskItem>(`/api/requirements/tasks/${id}`).then(t => { setTask(t); setHistory(h => h.map(x => (x.task_id === id ? t : x))) }).catch(() => {})
   }
 
@@ -553,7 +642,7 @@ export function RequirementsPage() {
     setActiveId(''); setTask(null); setActs([]); setAnalysis(null)
     setBusy(false); doneRef.current = false
     setText(''); setFiles([])
-    setQaMsg(null); setDetected(''); setIntentReason('')
+    setDetected(''); setIntentReason('')
     inputRef.current?.focus()
     const el = composerRef.current
     if (el) { el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash') }
@@ -593,6 +682,28 @@ export function RequirementsPage() {
       }
     } catch (e) {
       setFormErr(`删除会话失败：${e}`)
+    }
+  }
+
+  /** 重命名会话：双击会话名进入编辑，Enter/blur 提交、Esc 取消。
+  提交 PATCH /api/conversations/{id}；失败回滚并 toast。 */
+  async function saveRename(id: string, newTitle: string) {
+    const t = (newTitle || '').trim()
+    const cur = convs.find(c => c.conv_id === id)
+    const oldTitle = cur?.title || ''
+    setEditingId('')
+    if (!t || t === oldTitle) return  // 空或未改：静默退出
+    // 乐观更新
+    setConvs(prev => prev.map(c => c.conv_id === id ? { ...c, title: t } : c))
+    try {
+      const fd = new FormData()
+      fd.append('title', t)
+      await patchForm<{ conversation_id: string; title: string }>(`/api/conversations/${id}`, fd)
+      showToast(`已重命名为「${t}」`, 'ok')
+    } catch (e) {
+      // 回滚
+      setConvs(prev => prev.map(c => c.conv_id === id ? { ...c, title: oldTitle } : c))
+      showToast(`重命名失败：${e}`, 'err')
     }
   }
 
@@ -636,38 +747,107 @@ export function RequirementsPage() {
     }
     setBusy(true)
     try {
-      // 多轮会话主链路：/api/chat 一体做 classify + qa 回答 + 消息落库
+      // 多轮会话主链路（流式版）：/api/chat/stream 逐段推送意图 + 回答增量
+      // projects 必须带上：用户选了项目，问答就要基于该项目回答
+      // 附件统一进流：文本附件后端并入提问；图片/二进制后端终帧返回
+      // intent=analyze（模型读不了像素），前端据此转建任务——不再本地按
+      // 扩展名二分（本地判断和后端 _TEXT_SUFFIXES 双头维护易漂移）
       const cf = new FormData()
       cf.append('text', text.trim())
       if (convId) cf.append('conversation_id', convId)
       if (mode !== 'auto') cf.append('mode', mode)
-      const d = await postForm<{ conversation_id: string; intent: string; reason?: string; answer?: string | null }>('/api/chat', cf)
-      if (d.conversation_id && !convId) setConvId(d.conversation_id)
-      // 本地即时追加 user 消息（后端已落库）
-      setMessages(prev => [...prev, { role: 'user', content: text.trim(), created_at: '' }])
-      setDetected(d.intent)
-      setIntentReason(d.reason || '')
-      if (d.intent === 'qa') {
-        // 问答回合：直接渲染回答（后端已落库），一轮结束但会话继续
-        setMessages(prev => [...prev, { role: 'assistant', content: d.answer || '（无回答）', intent: 'qa', created_at: '' }])
-        setText(''); setFiles([])
-        setBusy(false)
+      if (selProjects.length) cf.append('projects', selProjects.join(' '))
+      files.forEach(f => cf.append('attachments', f))
+      // 本地即时追加 user 消息（后端已落库；文本附件内容后端会并入）
+      const askText = text.trim()
+      setMessages(prev => [...prev, { role: 'user', content: askText || '（附件提问）', created_at: '' }])
+      let streamConvId = ''
+      let intent = ''
+      let reason = ''
+      let streamAnswer = ''
+      let modelError = ''
+      // 占位气泡：发送即插入空 assistant 气泡，delta 到达前显示"正在思考…"
+      // ——此前等首帧 delta 才建气泡，期间用户看不到任何反馈，以为"卡住没反应"
+      let streamMsgIdx = -1
+      setMessages(prev => {
+        streamMsgIdx = prev.length
+        return [...prev, { role: 'assistant', content: '', intent: 'qa', created_at: '' }]
+      })
+      streamingRef.current = true
+      await postFormSse('/api/chat/stream', cf, ev => {
+        if (ev.error) { setFormErr(ev.error); return }
+        if (ev.conversation_id && !streamConvId) {
+          streamConvId = ev.conversation_id
+          if (!convId) setConvId(ev.conversation_id)
+        }
+        if (ev.intent) { intent = ev.intent; reason = ev.reason || '' }
+        if (typeof ev.delta === 'string') {
+          // 打字机：占位气泡已在，直接累加内容（不再"首帧才建气泡"）
+          streamAnswer += ev.delta
+          setMessages(prev => {
+            if (streamMsgIdx < 0) {
+              streamMsgIdx = prev.length
+              return [...prev, { role: 'assistant', content: streamAnswer, intent: 'qa', created_at: '' }]
+            }
+            const next = [...prev]
+            next[streamMsgIdx] = { ...next[streamMsgIdx], content: streamAnswer }
+            return next
+          })
+        }
+        if (ev.done) {
+          if (ev.model_error) modelError = ev.model_error
+          // 以终帧完整回答为准（防丢段）；model_error 时气泡标记错误样式 + 重试入口
+          setMessages(prev => {
+            const patch = { content: ev.answer || streamAnswer, model_error: ev.model_error || null }
+            if (streamMsgIdx < 0) return [...prev, { role: 'assistant', intent: 'qa', created_at: '', ...patch }]
+            const next = [...prev]
+            next[streamMsgIdx] = { ...next[streamMsgIdx], ...patch }
+            return next
+          })
+        }
+      })
+      setDetected(intent)
+      setIntentReason(reason)
+      streamingRef.current = false
+      if (modelError) {
+        // 模型被调了但失败（如切了不可用的模型）：保留输入供换模型后重发，
+        // toast 明示真因——不再「页面什么都没有」；历史仍刷新（新会话要进侧栏）
+        showToast(`模型调用失败：${modelError.slice(0, 80)}。输入已保留，换模型后可重试`, 'err')
+        refreshHistory()
+        inputRef.current?.focus()
+        return
+      }
+      setText('')
+      setFiles([])
+      if (intent === 'qa') {
         refreshHistory()
         return
       }
-      // analyze/full：建任务（带会话 ID），任务块进入消息流
-      const resolved: string = d.intent === 'analyze' ? 'analyze' : 'full'
-      const fd = new FormData()
-      if (text.trim()) fd.append('text', text)
-      const docExt = /\.(md|txt|csv|json|xml|ya?ml|log)$/i
-      const doc = files.find(f => docExt.test(f.name))
-      if (doc) fd.append('requirement', doc)
-      files.filter(f => f !== doc).forEach(f => fd.append('attachments', f))
-      fd.append('mode', resolved)
-      fd.append('projects', selProjects.join(' '))
-      if (workspace.trim()) fd.append('workspace', workspace)
-      if (branch.trim()) fd.append('branch', branch)
-      if (d.conversation_id) fd.append('conversation_id', d.conversation_id)
+      // analyze/full（含图片附件场景）：建任务（带会话 ID），任务块进入消息流
+      await runTask(askText, intent === 'analyze' ? 'analyze' : 'full', streamConvId || convId)
+    } catch (e) {
+      streamingRef.current = false
+      setFormErr(`发送失败：${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** 建分析任务并挂载活动流（run 的 analyze/full 分支；图片附件也走这里）。 */
+  async function runTask(askText: string, resolved: string, useConvId?: string) {
+    const fd = new FormData()
+    if (askText) fd.append('text', askText)
+    const docExt = /\.(md|txt|csv|json|xml|ya?ml|log)$/i
+    const doc = files.find(f => docExt.test(f.name))
+    if (doc) fd.append('requirement', doc)
+    files.filter(f => f !== doc).forEach(f => fd.append('attachments', f))
+    fd.append('mode', resolved)
+    fd.append('projects', selProjects.join(' '))
+    if (workspace.trim()) fd.append('workspace', workspace)
+    if (branch.trim()) fd.append('branch', branch)
+    const cid = useConvId || convId
+    if (cid) fd.append('conversation_id', cid)
+    try {
       const created = await postForm<{ task_id: string }>('/api/requirements/tasks', fd)
       setMessages(prev => [...prev, {
         role: 'assistant', content: `已创建分析任务，8-Agent 流水线执行中。`,
@@ -679,8 +859,6 @@ export function RequirementsPage() {
       openTask(created.task_id)
     } catch (e) {
       setFormErr(`任务创建失败：${e}`)
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -710,79 +888,55 @@ export function RequirementsPage() {
 
   return (
     <div className="req-layout">
-      {/* ── 左侧：会话列表（多轮）+ 任务入口 ────────────────────────── */}
+      {/* ── 左侧：会话列表（z.ai 式：新建按钮 + 按时间分组） ─────────── */}
+      {/* 任务不单列：任务挂在会话消息流里（📦 块可点击），最近任务 Ctrl+K 直达 */}
       <div className="chat-side">
-        <div className="side-head">
-          <b>会话</b>
-          <button style={{ padding: '3px 10px', fontSize: 12 }} onClick={newSession}>＋ 新建</button>
-        </div>
+        <button className="new-chat-btn" onClick={newSession}>＋ 新建会话</button>
         <div className="side-list">
           {convs.length === 0 ? <div className="empty" style={{ padding: 18 }}>暂无会话，输入内容开始对话</div> :
-            convs.map(c => (
-              <div key={c.conv_id} className={`task-item ${c.conv_id === convId ? 'active' : ''}`}
-                onClick={() => openConversation(c.conv_id)}>
-                <div className="t-title">{c.title || c.conv_id}</div>
-                <div className="t-meta">
-                  <span className="rel-time">{relTime(c.updated_at)}</span>
-                  <span className="t-del" title="删除会话"
-                    onClick={e => { e.stopPropagation(); deleteConversation(c.conv_id, c.title) }}>×</span>
-                </div>
+            groupConvs(convs).map(([g, items]) => (
+              <div key={g} className="conv-group">
+                <div className="conv-glabel">{g}</div>
+                {items.map(c => (
+                  <div key={c.conv_id} className={`conv-item ${c.conv_id === convId ? 'active' : ''}`}
+                    onClick={() => editingId !== c.conv_id && openConversation(c.conv_id)}>
+                    {editingId === c.conv_id ? (
+                      <input className="c-edit" defaultValue={c.title || c.conv_id} autoFocus
+                        onClick={e => e.stopPropagation()}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') { e.preventDefault(); saveRename(c.conv_id, (e.target as HTMLInputElement).value) }
+                          else if (e.key === 'Escape') { e.preventDefault(); setEditingId('') }
+                        }}
+                        onBlur={e => saveRename(c.conv_id, e.target.value)} />
+                    ) : (
+                      <span className="c-title"
+                        onDoubleClick={e => { e.stopPropagation(); setEditingId(c.conv_id) }}
+                        title="双击重命名">{c.title || c.conv_id}</span>
+                    )}
+                    <span className="t-del" title="删除会话"
+                      onClick={e => { e.stopPropagation(); deleteConversation(c.conv_id, c.title) }}>×</span>
+                  </div>
+                ))}
               </div>
             ))}
-        </div>
-        <div className="side-head" style={{ marginTop: 8 }}>
-          <b>任务</b>
-          <span className="hint" style={{ fontSize: 11 }}>{history.length}</span>
-        </div>
-        <div className="side-list" style={{ maxHeight: 200 }}>
-          {history.map(t => (
-            <div key={t.task_id} className={`task-item ${t.task_id === activeId ? 'active' : ''}`}
-              onClick={() => openTask(t.task_id)}>
-              <div className="t-title">{t.title || t.task_id}</div>
-              <div className="t-meta">
-                <span className={`badge ${STATUS_CLS[t.status] ?? 'neutral'}`}>
-                  {t.status === 'running' ? `${t.progress}%` : t.status === 'completed' ? '完成' : t.status === 'pending' ? '排队' : '失败'}
-                </span>
-                <span className="rel-time">{relTime(t.created_at)}</span>
-              </div>
-            </div>
-          ))}
         </div>
       </div>
 
       {/* ── 右侧：聊天主区 ─────────────────────────────────────────── */}
       <div className="chat-main">
-        {/* 引擎条（模型可切换） */}
-        <div className="engine-bar">
-          <span className={`badge ${dsh?.ready ? 'ok' : dsh?.callable ? 'warn' : 'warn'}`}>{dsh?.ready ? 'DSH' : dsh?.callable ? 'DSH 待验证' : 'DSH 不可用'}</span>
-          <ModelBar currentModel={dsh?.model} onOpen={() => setDrawerOpen(true)} />
-          <ModelModal open={drawerOpen} currentKey={dsh?.provider_key}
-            onClose={() => setDrawerOpen(false)} onChanged={refreshRuntime} />
-          {dsh?.provider ? <span>{dsh.provider}</span> : null}
-          {dsh?.mode ? <><span className="sep">·</span><span>{dsh.mode} 载体</span></> : null}
-          {!dsh?.api_key_configured ? <span className="badge warn">未显式配置 Key · 将尝试凭据库</span> : null}
-          {mode !== 'auto' ? <span className="badge neutral">模式：{MODE_LABEL[mode]}</span> : (detected ? <span className="badge neutral" title={intentReason || undefined}>识别：{MODE_LABEL[detected]}{intentReason ? ` · ${intentReason}` : ''}</span> : null)}
-          {task ? (
-            <><span className="sep" style={{ margin: '0 2px' }}>|</span>
-              <span className={`badge ${STATUS_CLS[task.status] ?? 'neutral'}`}>
-                {task.status === 'running' ? `${task.progress}% ${task.stage}` : task.status === 'completed' ? '已完成' : task.status === 'pending' ? '排队中' : '失败'}
-              </span>
-              <span className="rel-time">耗时 {fmtDuration(task.created_at)}</span></>
-          ) : null}
-        </div>
-
-        {/* 流程轨道：常驻 8-Agent 进度 */}
-        <Rail acts={acts} task={task} />
+        {/* 流程轨道：仅在有任务时显示（欢迎页/纯问答不占位） */}
+        {task ? <Rail acts={acts} task={task} /> : null}
 
         <div className="chat-msgs" ref={msgsRef}
           onScroll={() => {
             const el = msgsRef.current
             if (el) stickRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 60
           }}>
+          <div className="chat-col">
           {/* 会话消息流（多轮）：user / assistant 问答气泡 + 任务块 */}
           {messages.map((m, i) => m.task_id ? (
             <div className="msg-sys" key={i}>
-              <span className={`pill ${m.task_id === activeId ? '' : 'neutral'}`}
+              <span className={`pill ${m.task_id === activeId ? 'on' : 'neutral'}`}
                 style={{ cursor: 'pointer' }}
                 onClick={() => m.task_id && openTask(m.task_id)}>
                 📦 {m.content}{m.task_id === activeId ? '（当前）' : ' · 点击查看'}
@@ -796,10 +950,35 @@ export function RequirementsPage() {
               </div>
             </div>
           ) : (
-            <div className="msg-assistant" key={i}>
-              <div className="bubble-a">
-                <div style={{ whiteSpace: 'pre-wrap' }}>{m.content}</div>
-                {m.intent ? <div className="b-meta"><span className="badge neutral">{MODE_LABEL[m.intent] ?? m.intent}</span></div> : null}
+            <div className={`msg-assistant ${busy && i === messages.length - 1 && m.content === '' ? 'pending' : ''}`} key={i}>
+              <div className={`bubble-a${m.model_error ? ' err' : ''}`}>
+                <div style={{ whiteSpace: 'pre-wrap' }}>
+                  {m.content === '' && busy && i === messages.length - 1 ? (
+                    <span className="thinking-hint"><span className="spinner" style={{ width: 12, height: 12, marginRight: 7, verticalAlign: -1 }} />正在思考…</span>
+                  ) : (
+                    <>
+                      {m.content}{busy && i === messages.length - 1 && !m.task_id ? <span className="caret" /> : null}
+                    </>
+                  )}
+                </div>
+                {m.model_error ? (
+                  <div className="b-meta">
+                    <button className="link" onClick={() => {
+                      if (busy) return
+                      // 重试前移除失败的这对气泡（user + 错误 assistant），
+                      // run() 会重新追加——否则重试一次多两条重复消息
+                      setMessages(prev => {
+                        const last = prev[prev.length - 1]
+                        const before = prev[prev.length - 2]
+                        if (last?.model_error && before?.role === 'user') return prev.slice(0, -2)
+                        if (last?.model_error) return prev.slice(0, -1)
+                        return prev
+                      })
+                      run()
+                    }}>↻ 重试</button>
+                    <span className="badge bad">模型调用失败</span>
+                  </div>
+                ) : m.intent ? <div className="b-meta"><span className="badge neutral">{MODE_LABEL[m.intent] ?? m.intent}</span></div> : null}
               </div>
             </div>
           ))}
@@ -853,72 +1032,91 @@ export function RequirementsPage() {
               {analysis ? <ResultPanel a={analysis} /> :
                 running ? <div className="msg-sys"><span className="pill"><span className="spinner" style={{ width: 10, height: 10, marginRight: 6, verticalAlign: -1 }} />{task.message || '分析中...'}</span></div> : null}
             </>
-          ) : messages.length === 0 && !qaMsg ? (
+          ) : messages.length === 0 ? (
             <div className="welcome">
               <div className="w-icon">🧭</div>
               <h4>AI 测试导航 · 需求分析</h4>
               <p>粘贴需求描述或接口 URL（支持<b>直接粘贴/拖入文档和图片</b>），
-                8 个 FDE Agent 按上方流程协同完成分析，全程实时可见。</p>
-              <p className="hint" style={{ marginTop: 14 }}>多轮对话：问答、分析、追问都在同一个会话里连续进行</p>
-              <p className="hint">点击上方模型名可管理并切换 API 地址 / Key / 模型 ID</p>
+                8 个 FDE Agent 协同完成分析，全程实时可见。<br />
+                问答、分析、追问都在同一个会话里连续进行。</p>
+              <div className="w-examples">
+                {EXAMPLES.map(([icon, title, ex]) => (
+                  <button key={title} className="w-card"
+                    onClick={() => { setText(ex); inputRef.current?.focus() }}>
+                    <span className="wc-icon">{icon}</span>
+                    <b>{title}</b>
+                    <span className="wc-text">{ex}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="hint" style={{ marginTop: 16 }}>点击示例快速开始 · 模型管理在输入框下方的模型按钮</p>
             </div>
           ) : null}
+          </div>
         </div>
 
-        {/* ── composer：粘贴/拖拽即上传 ────────────────────────────── */}
-        <div className={`composer ${dragOver ? 'drag' : ''}`} ref={composerRef}
-          onDragOver={e => { e.preventDefault(); setDragOver(true) }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={onDrop}>
-          {dragOver ? <div className="drop-hint">松开以添加附件（文档/图片）</div> : null}
-          {/* 附件 chips */}
-          {files.length > 0 ? (
-            <div className="attach-bar">
-              {files.map((f, i) => (
-                <span key={i} className="attach-chip">
-                  {f.type.startsWith('image/') ? (
-                    <img src={URL.createObjectURL(f)} alt={f.name} />
-                  ) : (
-                    <span>📄</span>
-                  )}
-                  {f.name}
-                  <span className="a-size">{fileSize(f.size)}</span>
-                  <i onClick={() => setFiles(prev => prev.filter((_, j) => j !== i))}>×</i>
-                </span>
-              ))}
+        {/* ── composer：一个大盒子（选项全部收成 chip，z.ai 式） ─────── */}
+        <div className="composer-wrap">
+          <div className={`composer ${dragOver ? 'drag' : ''}`} ref={composerRef}
+            onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}>
+            {dragOver ? <div className="drop-hint">松开以添加附件（文档/图片）</div> : null}
+            {/* 附件 chips */}
+            {files.length > 0 ? (
+              <div className="attach-bar">
+                {files.map((f, i) => (
+                  <span key={i} className="attach-chip">
+                    {f.type.startsWith('image/') ? (
+                      <img src={URL.createObjectURL(f)} alt={f.name} />
+                    ) : (
+                      <span>📄</span>
+                    )}
+                    {f.name}
+                    <span className="a-size">{fileSize(f.size)}</span>
+                    <i onClick={() => setFiles(prev => prev.filter((_, j) => j !== i))}>×</i>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            <textarea ref={inputRef} value={text} onChange={e => setText(e.target.value)} rows={2}
+              onPaste={onPaste}
+              placeholder="输入需求描述、接口 URL 或直接提问…（Enter 发送 · Shift+Enter 换行）"
+              onKeyDown={e => {
+                // Ctrl+Enter 兼容旧习惯；Enter 直接发送（中文输入法选词回车不发送）
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault(); if (!busy) run(); return
+                }
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                  e.preventDefault(); if (!busy) run()
+                }
+              }} />
+            <div className="cx-row">
+              <div className="cx-left">
+                <button className="cx-icon" title="添加附件（也可直接粘贴 / 拖入）"
+                  onClick={() => fileRef.current?.click()}>📎</button>
+                <input ref={fileRef} type="file" multiple hidden
+                  onChange={e => { addFiles(e.target.files ?? []); e.target.value = '' }} />
+                <ProjectPicker options={projectOpts} value={selProjects} onChange={setSelProjects}
+                  workspace={workspace} branch={branch}
+                  onWorkspace={setWorkspace} onBranch={setBranch} />
+                <ModePicker value={mode} onChange={setMode} />
+                <ModelBar currentModel={dsh?.model} onOpen={() => setDrawerOpen(true)} ok={dsh?.ready} />
+              </div>
+              <button className="cx-send" onClick={run}
+                disabled={busy || !(text.trim() || files.length)}>发送</button>
             </div>
-          ) : null}
-          <div className="c-tools">
-            <ProjectMultiSelect options={projectOpts} value={selProjects} onChange={setSelProjects} />
-            <button className="link" onClick={() => setAdvOpen(o => !o)}>{advOpen ? '收起选项 ▲' : '工作区/分支 ▼'}</button>
           </div>
-          {advOpen ? (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 8 }}>
-              <div><label>源码工作区</label><input value={workspace} onChange={e => setWorkspace(e.target.value)} /></div>
-              <div><label>分支</label><input value={branch} onChange={e => setBranch(e.target.value)} /></div>
-            </div>
-          ) : null}
-          <div className="mode-sel">
-            {(['auto', 'qa', 'analyze', 'full'] as const).map((m) => (
-              <button key={m} type="button" className={`mode-btn ${mode === m ? 'on' : ''}`}
-                onClick={() => { setMode(m); if (m !== 'qa') setQaMsg(null) }}>
-                {MODE_LABEL[m]}
-              </button>
-            ))}
+          {/* 状态行：错误 / 运行中 / 意图识别反馈（"模型思考中"提示已移到消息区占位气泡） */}
+          <div className="c-note">
+            {formErr ? <span style={{ color: '#b42318' }}>{formErr}</span> :
+              running ? '当前任务分析中，完成后可继续提问' :
+                files.length > 0 ? `${files.length} 个附件待提交` :
+                  selProjects.length > 0 ? `已指定 ${selProjects.length} 个项目` :
+                    detected ? `识别：${MODE_LABEL[detected] ?? detected}${intentReason ? ` · ${intentReason}` : ''}` : ''}
           </div>
-          <textarea ref={inputRef} value={text} onChange={e => setText(e.target.value)} rows={3}
-            onPaste={onPaste}
-            placeholder="输入需求描述、接口 URL 或直接提问（支持追问），Ctrl+Enter 发送..."
-            onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run() }} />
-          <div className="c-foot">
-            <span className="hint">
-              {formErr ? <span style={{ color: '#b42318' }}>{formErr}</span> :
-                running ? '当前任务分析中，完成后可继续提问' :
-                  files.length > 0 ? `${files.length} 个附件待提交` :
-                    selProjects.length > 0 ? `已指定 ${selProjects.length} 个项目` : '多轮对话 · 问答与分析在同一会话连续进行'}
-            </span>
-            <button onClick={run} disabled={busy}>{mode === 'qa' ? '发送' : '发送'}</button>
-          </div>
+          <ModelModal open={drawerOpen} currentKey={dsh?.provider_key} currentModel={dsh?.model}
+            onClose={() => setDrawerOpen(false)} onChanged={refreshRuntime} />
         </div>
       </div>
     </div>

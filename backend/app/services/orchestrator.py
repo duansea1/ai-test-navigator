@@ -1,7 +1,7 @@
-"""分析任务编排：规则分析（离线保底）+ DSH 8-Agent 语义分析流水线。
+"""分析任务编排：AI-first 8-Agent 语义分析流水线 + 规则分析离线保底。
 
 流水线（每 Agent 独立 DSH 会话，阶段失败降级跳过）：
-  1. requirement-analyst  需求结构化          → requirements 表
+  1. requirement-analyst  需求结构化（AI 主路径）  → requirements 表
   2. project-scout        项目相关性判断      → 内存（供后续阶段）
   3. code-locator         代码证据定位        → code_evidence 表（可调用 fs/grep 工具实查源码）
   4. call-chain           调用链/影响范围     → impact_scopes 表
@@ -11,7 +11,9 @@
   8. report-writer        三视角报告摘要      → reports 表
 
 进度模型：内存 task_progress（版本号，SSE 消费）+ DB 状态双写。
-降级链路：DSH 不可用 → 规则分析 + 规则解析需求入库（保留分析能力，不阻塞）。
+降级链路（2026-09-02 AI-first 调整）：requirement-analyst 两次都拿不到结构化需求
+→ 规则分析（NavigatorAnalyzer）离线保底，活动流显式标注「模型未参与」。
+模型成功时不再无条件先跑规则分析拆文档。
 """
 from __future__ import annotations
 
@@ -22,11 +24,15 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
+from uuid import uuid4
 
 from app.core.config import get_settings
 from app.dsh import agents as agent_registry
 from app.dsh.runtime import manager as dsh_manager
 from app.db import entities
+from app.models.schemas import (AnalysisReport, CodeEvidence, ImplementationStatus,
+                                ImpactScope, Priority, RequirementAssessment,
+                                RequirementItem, RiskLevel, TestCase, Verdict)
 from app.services.agent_validation import ValidationReport, validate_stage
 from app.services.analyzer import NavigatorAnalyzer
 from app.services.reporter import write_reports
@@ -315,20 +321,38 @@ def _agent_done(task_id: str, agent_id: str, ok: bool, summary: str,
 
 
 def _requirement_digest(items: list[dict[str, Any]], limit: int = 12) -> str:
-    """需求条目紧凑摘要（供下游 Agent 消费，控制 token）。"""
+    """需求条目紧凑摘要（供下游 Agent 消费，控制 token）。
+
+    超过 limit 时**不静默截断**：尾部注明「另有 N 条未列出」——下游 Agent
+    至少知道需求全集的规模，不会把 12 条当成全部（输入保真：宁可显式
+    告知截断，也不让模型在不知情的状态下漏分析）。"""
     lines = []
     for it in items[:limit]:
         ac = "；".join(it.get("acceptance_criteria", [])[:3])
         lines.append(f"- {it['id']} [{it.get('priority', 'P1')}] {it['title']}：{it.get('description', '')[:150]}"
                      + (f"（验收：{ac[:200]}）" if ac else ""))
+    overflow = len(items) - limit
+    if overflow > 0:
+        lines.append(f"（另有 {overflow} 条需求未列出，ID 从 {items[limit]['id']} 起——"
+                     f"如需覆盖请说明，后续阶段可分批处理）")
     return "\n".join(lines)
 
 
 def _evidence_digest(evidence: list[dict[str, Any]], limit: int = 15) -> str:
+    """代码证据摘要：定位信息 + 代码原文片段（impl-reviewer 判定 fail/pass 的依据）。
+
+    snippet 库里存了最多 4000 字原文——此前只给 path:line+symbol 不给内容，
+    审查 Agent 拿不到代码就得凭位置猜结论。超 limit 显式注明截断。"""
     lines = []
     for ev in evidence[:limit]:
+        snippet = str(ev.get("summary", "") or "").strip()
+        if snippet:
+            snippet = " 代码：" + snippet[:160]
         lines.append(f"- {ev.get('project', '?')} {ev.get('path', '?')}:{ev.get('line', '?')} "
-                     f"{ev.get('symbol', '')}（置信 {ev.get('confidence', '?')}）")
+                     f"{ev.get('symbol', '')}（置信 {ev.get('confidence', '?')}）{snippet}")
+    overflow = len(evidence) - limit
+    if overflow > 0:
+        lines.append(f"（另有 {overflow} 处证据未列出）")
     return "\n".join(lines)
 
 
@@ -338,6 +362,23 @@ def _rule_fallback_requirements(report) -> list[dict[str, Any]]:
          "priority": r.priority.value, "acceptance_criteria": r.acceptance_criteria}
         for r in report.requirements
     ]
+
+
+def _notify_conversation(task_id: str, text: str, intent: str = "full") -> None:
+    """任务终态回写会话消息流——多轮追问能引用结论的前提（输出侧记忆闭环）。
+
+    此前会话里只有「已创建任务执行中」，任务完成后追问「刚才结论如何」，
+    历史注入里没有结论，问答 Agent 答不上来。回写为带 task_id 的 assistant
+    消息：会话流渲染成可点击任务块，_history_block 注入让问答接上任务话题。
+    任务不经会话创建（直连 API）时反查为空，静默跳过。"""
+    try:
+        conv_id = entities.find_conversation_of_task(task_id)
+        if not conv_id:
+            return
+        entities.save_message(conv_id, "assistant", text, intent=intent, task_id=task_id)
+        entities.touch_conversation(conv_id)
+    except Exception:  # 回写失败不影响任务本身
+        pass
 
 
 def _run_task(task_id: str, mode: str = "full") -> None:
@@ -350,21 +391,15 @@ def _run_task(task_id: str, mode: str = "full") -> None:
     degraded: list[str] = []
 
     try:
-        # ── 阶段 0：规则分析（离线保底，产出报告与基础需求条目）──────────────
-        _emit(task_id, "rule-analysis", 15, "正在执行规则分析（接口定位/证据扫描）")
         workspace = task["workspace"] or str(s.workspace)
         branch = task["branch"] or s.branch
         projects = (task["projects"] or "").split()
-        report = _run_rule_analysis(task, workspace, branch, projects)
-        outputs = write_reports(report, s.report_dir)
-        entities.save_report(task_id, report.report_id, outputs, {"requirements": len(report.requirements)})
-        entities.update_task(task_id, report_id=report.report_id)
-        _emit(task_id, "rule-analysis", 20, f"规则分析完成，报告 {report.report_id}")
-
         source_text = task["source_text"] or ""
 
-        # ── 阶段 1：需求结构化（requirement-analyst，校验差时同会话重问一次）──
-        _emit(task_id, "requirement-analyst", 28, "Agent[需求分析] 正在解析需求条目")
+        # ── 阶段 1：需求结构化（AI-first：requirement-analyst 先行）──────────
+        # 文档语义由 AI 处理（用户铁律）。规则分析只在 Agent 两次都拿不到
+        # 可用结构化需求时作为离线保底执行，并明确标注「模型未参与」。
+        _emit(task_id, "requirement-analyst", 15, "Agent[需求分析] 正在解析需求条目")
         items, session, vrep = _run_agent(task_id, "requirement-analyst", source_text[:6000])
         dsh_mode = items is not None
         if dsh_mode and _validation_is_poor(items, vrep):
@@ -383,13 +418,31 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                     items, vrep = items2, vrep2
             # items2 is None：重问执行失败，保留第一次
             dsh_mode = items is not None
+
+        report: AnalysisReport | None = None
         if not dsh_mode:
-            items = _rule_fallback_requirements(report)
+            # AI 保底：模型两次都拿不到结构化需求 → 规则分析离线保底（显式降级）
             degraded.append("requirement-analyst")
-            _emit(task_id, "requirement-analyst", 32, f"DSH 未启用/解析失败，规则解析 {len(items)} 条需求")
-            _agent_done(task_id, "requirement-analyst", False, f"DSH 未参与，规则解析 {len(items)} 条需求")
+            _emit(task_id, "requirement-analyst", 20, "AI 需求分析未成功，启用规则保底（模型未参与）")
+            report = _run_rule_analysis(task, workspace, branch, projects)
+            outputs = write_reports(report, s.report_dir)
+            entities.save_report(task_id, report.report_id, outputs,
+                                 {"requirements": len(report.requirements)})
+            entities.update_task(task_id, report_id=report.report_id)
+            _emit(task_id, "rule-analysis", 24,
+                  f"规则保底完成，报告 {report.report_id}（模型未参与需求拆分）")
+            items = _rule_fallback_requirements(report)
+            _agent_done(task_id, "requirement-analyst", False,
+                        f"AI 未参与，规则解析 {len(items)} 条需求（离线保底）")
         else:
-            _emit(task_id, "requirement-analyst", 32, f"Agent[需求分析] 输出 {len(items)} 条结构化需求")
+            # AI 成功：报告骨架由 AI 需求条目生成（不跑规则分析）；证据/用例/
+            # 裁决随后续阶段产出，收尾时用流水线实际产物重建报告落盘。
+            report = _ai_initial_report(task, items, branch, projects)
+            outputs = write_reports(report, s.report_dir)
+            entities.save_report(task_id, report.report_id, outputs,
+                                 {"requirements": len(items)})
+            entities.update_task(task_id, report_id=report.report_id)
+            _emit(task_id, "requirement-analyst", 28, f"Agent[需求分析] 输出 {len(items)} 条结构化需求")
             _agent_done(task_id, "requirement-analyst", True,
                         f"输出 {len(items)} 条结构化需求（含优先级与验收标准）", vrep)
         entities.save_requirements(task_id, items)
@@ -397,6 +450,8 @@ def _run_task(task_id: str, mode: str = "full") -> None:
         if not items:
             _emit(task_id, "completed", 100, "分析完成：未解析出需求条目", status="completed")
             entities.update_task(task_id, status="completed")
+            _notify_conversation(
+                task_id, "分析任务完成：未从输入中解析出需求条目（可能不是业务需求描述，换个说法或补充细节可重试）。")
             return
 
         # ── DSH 可用：继续 2-8 阶段语义分析 ────────────────────────────────
@@ -441,11 +496,13 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 _emit(task_id, "code-locator", 56, "代码证据定位失败/无结果，跳过该阶段")
                 _agent_done(task_id, "code-locator", False, "代码证据定位失败/无结果")
 
-            # 阶段 4：调用链（call-chain）
+            # 阶段 4：调用链（call-chain，基于已定位证据——不凭空想链路）
             _emit(task_id, "call-chain", 62, "Agent[调用链] 正在分析跨项目调用链")
+            ev_digest4 = _evidence_digest(entities.list_code_evidence(task_id))
             chains, _, vrep = _run_agent(
                 task_id, "call-chain",
                 f"项目：{', '.join(projects)}\n\n需求条目：\n{req_digest}\n\n"
+                f"已定位的代码证据（链路步骤尽量从这里出发，可用 grep/read 补查）：\n{ev_digest4 or '（无代码证据）'}\n\n"
                 "输出 JSON：chains[{{name,risk(high|medium|low),steps[{{project,component,call}}]}}]。")
             if isinstance(chains, list) and chains:
                 n = entities.save_impact_scopes(task_id, chains)
@@ -477,17 +534,38 @@ def _run_task(task_id: str, mode: str = "full") -> None:
 
             # 分析模式：只跑需求结构化 + 代码定位 + 实现审查，不生成用例/报告
             if mode == "analyze":
+                n_ev_a = len(entities.list_code_evidence(task_id))
                 _emit(task_id, "completed", 100,
-                      f"分析完成（仅分析）：{len(items or [])} 条需求 / {len(entities.list_code_evidence(task_id))} 处证据",
+                      f"分析完成（仅分析）：{len(items or [])} 条需求 / {n_ev_a} 处证据",
                       status="completed")
                 entities.update_task(task_id, status="completed")
+                # AI-first：analyze 模式收尾也用流水线实际产物重建报告落盘，
+                # 报告与 DB 一致（而非阶段 0 规则分析快照）。
+                report = _rebuild_report_from_pipeline(task_id, report, branch, projects)
+                outputs = write_reports(report, s.report_dir)
+                entities.save_report(task_id, report.report_id, outputs,
+                                     {"requirements": len(items or []),
+                                      "evidence": n_ev_a,
+                                      "test_cases": 0})
+                _notify_conversation(
+                    task_id,
+                    f"分析任务完成（仅分析）：{len(items or [])} 条需求、{n_ev_a} 处代码证据。"
+                    "可直接追问结论细节，或让我生成测试用例与报告。", intent="analyze")
                 return
 
-            # 阶段 6：测试用例（test-designer）
+            # 阶段 6：测试用例（test-designer，带实现审查结论——高风险项加密度）
             _emit(task_id, "test-designer", 82, "Agent[测试设计] 正在生成五类测试用例")
+            impl_digest = ""
+            if impl_result:
+                # 审查结论紧凑摘要：缺口与风险项是用例设计的重点来源
+                impl_digest = "\n\n实现审查结论（重点为缺口与待复核项设计用例）：\n" + "\n".join(
+                    f"- {a.get('requirement_id')} {a.get('status')}（{a.get('verdict')}）"
+                    + (f" 缺口：{'；'.join(a.get('gaps', [])[:2])}" if a.get("gaps") else "")
+                    for a in impl_result if isinstance(a, dict)
+                )[:2400]
             cases, _, vrep = _run_agent(
                 task_id, "test-designer",
-                f"需求条目：\n{req_digest}\n\n"
+                f"需求条目：\n{req_digest}{impl_digest}\n\n"
                 "输出 JSON：cases[{{requirement_id,title,kind(functional|negative|boundary|idempotency|security),"
                 "preconditions[],steps[],expected}}]。",
                 items=items)
@@ -500,11 +578,18 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 _emit(task_id, "test-designer", 86, "测试用例生成失败/无结果，跳过该阶段")
                 _agent_done(task_id, "test-designer", False, "测试用例生成失败/无结果")
 
-            # 阶段 7：质量裁决（quality-judge，与 impl-reviewer 合并入库）
+            # 阶段 7：质量裁决（quality-judge，与 impl-reviewer 合并入库；
+            # 带已入库的测试用例概览——裁决要回答「该测的测全了没有」）
             _emit(task_id, "quality-judge", 90, "Agent[质量裁决] 正在评估风险与上线建议")
+            saved_cases = entities.list_test_cases(task_id)
+            case_digest = "\n".join(
+                f"- {c.get('req_ref')} [{c.get('case_type')}] {c.get('title', '')[:60]}"
+                for c in saved_cases[:30]
+            )[:2000]
             verdicts, _, vrep = _run_agent(
                 task_id, "quality-judge",
                 f"需求条目：\n{req_digest}\n\n实现审查：\n{json.dumps(impl_result, ensure_ascii=False)[:2000] if impl_result else '（无）'}\n\n"
+                f"已生成测试用例（{len(saved_cases)} 条，裁决时可评估覆盖缺口）：\n{case_digest or '（无）'}\n\n"
                 "输出 JSON：verdicts[{{requirement_id,risk(high|medium|low),rationale,recommendation}}]。",
                 items=items)
             merged = _merge_assessments(items, impl_result, verdicts)
@@ -540,6 +625,15 @@ def _run_task(task_id: str, mode: str = "full") -> None:
                 _emit(task_id, "report-writer", 98, "报告摘要失败，跳过该阶段")
                 _agent_done(task_id, "report-writer", False, "报告摘要失败，跳过该阶段")
 
+            # 收尾前用流水线实际产物重建报告落盘（AI-first：报告内容来自 AI 阶段，
+            # 而非阶段 0 的规则分析），保持报告与 DB 真相一致。
+            report = _rebuild_report_from_pipeline(task_id, report, branch, projects)
+            outputs = write_reports(report, s.report_dir)
+            entities.save_report(task_id, report.report_id, outputs,
+                                 {"requirements": len(items),
+                                  "evidence": len(entities.list_code_evidence(task_id)),
+                                  "test_cases": len(entities.list_test_cases(task_id))})
+
         # ── 收尾 ─────────────────────────────────────────────────────────────
         parts = [f"{len(items)} 条需求",
                  f"{len(entities.list_code_evidence(task_id))} 处证据",
@@ -549,9 +643,160 @@ def _run_task(task_id: str, mode: str = "full") -> None:
             parts.append(f"降级阶段 {len(degraded)}：{'/'.join(degraded)}")
         _emit(task_id, "completed", 100, "分析完成：" + "，".join(parts), status="completed")
         entities.update_task(task_id, status="completed")
+        # 结论回写会话（高风险/待复核数一并带上，追问「刚才结论如何」有据可答）
+        try:
+            merged_all = entities.list_assessments(task_id)
+            high = sum(1 for a in merged_all if a.get("risk") == "high")
+            review = sum(1 for a in merged_all if a.get("verdict") in ("needs_review", "blocked"))
+            risk_note = f"，高风险 {high} 条、待复核 {review} 条" if merged_all else ""
+        except Exception:
+            risk_note = ""
+        _notify_conversation(
+            task_id,
+            "分析任务完成：" + "，".join(parts) + risk_note + "。可直接追问结论细节。")
     except Exception as exc:  # 任务级兜底：失败入库，不崩服务
         entities.update_task(task_id, status="failed", error=str(exc)[:2000])
         _emit(task_id, "failed", 100, f"分析失败：{exc}", status="failed", error=str(exc))
+        _notify_conversation(
+            task_id, f"分析任务失败：{str(exc)[:300]}。可重试或换个输入再分析。")
+
+
+def _ai_initial_report(task: dict[str, Any], items: list[dict[str, Any]],
+                      branch: str, projects: list[str]) -> AnalysisReport:
+    """AI 成功路径的初始报告骨架（需求来自 requirement-analyst，不含证据/用例/裁决）。
+
+    证据、影响链、用例、裁决在后续 Agent 阶段产出，收尾时由
+    _rebuild_report_from_pipeline() 用 DB 实际产物重建，保证报告与 DB 一致。
+    """
+    reqs = [_to_requirement_item(it) for it in items]
+    return AnalysisReport(
+        report_id=f"RPT-{uuid4().hex[:10]}",
+        requirement_source=task.get("title") or "AI 结构化需求",
+        projects=projects,
+        branch=branch,
+        requirements=reqs,
+        notes=["需求条目由 requirement-analyst（AI）结构化产出；证据/用例/裁决由后续 Agent 阶段填充。"],
+    )
+
+
+def _rebuild_report_from_pipeline(task_id: str, base: AnalysisReport,
+                                  branch: str, projects: list[str]) -> AnalysisReport:
+    """收尾重建报告：用 DB 中本任务的实际产物（证据/链路/用例/裁决）回填 base。
+
+    AI-first 架构下报告不应是阶段 0 规则分析的快照，而应反映流水线真实产出；
+    重建后落盘的 html/md/json 与各 tab 结果面板、reports 中心一致。
+    """
+    try:
+        ev_rows = entities.list_code_evidence(task_id)
+        evidence = [
+            CodeEvidence(
+                id=f"EV-{i + 1:03d}", project=str(e.get("project", "")),
+                path=str(e.get("path", "")),
+                line=int(e["line_no"]) if e.get("line_no") else None,
+                symbol=str(e.get("symbol", "")) or None,
+                evidence=str(e.get("summary", "")),
+                relevance=str(e.get("relevance", "")),
+            )
+            for i, e in enumerate(ev_rows)
+        ]
+    except Exception:
+        evidence = []
+
+    try:
+        imp_rows = entities.list_impact_scopes(task_id)
+        impacts = [
+            ImpactScope(
+                id=f"IMP-{i + 1:03d}", requirement_id="",
+                area=str(r.get("area", "")),
+                affected_items=r.get("steps", []) if isinstance(r.get("steps"), list) else [],
+                risk_level=RiskLevel(str(r.get("risk_level", "medium")) or "medium"),
+                rationale=str(r.get("project", "")),
+            )
+            for i, r in enumerate(imp_rows)
+        ]
+    except Exception:
+        impacts = []
+
+    try:
+        tc_rows = entities.list_test_cases(task_id)
+        cases = [
+            TestCase(
+                id=f"TC-{i + 1:03d}", requirement_id=str(c.get("req_ref", "")),
+                title=str(c.get("title", "")), kind=str(c.get("case_type", "functional")),
+                preconditions=c.get("preconditions", []) if isinstance(c.get("preconditions"), list) else [],
+                steps=c.get("steps", []) if isinstance(c.get("steps"), list) else [],
+                expected=str(c.get("expected", "")),
+            )
+            for i, c in enumerate(tc_rows)
+        ]
+    except Exception:
+        cases = []
+
+    try:
+        a_rows = entities.list_assessments(task_id)
+        assessments = []
+        for a in a_rows:
+            vstr = str(a.get("verdict", "needs_review"))
+            try:
+                verdict = Verdict(vstr)
+            except ValueError:
+                verdict = Verdict.NEEDS_REVIEW
+            # status：DB 未单独存实现状态，由 verdict 近似映射（needs_review→uncertain）
+            status_map = {
+                "pass": ImplementationStatus.IMPLEMENTED,
+                "fail": ImplementationStatus.NOT_FOUND,
+                "blocked": ImplementationStatus.PARTIAL,
+                "needs_review": ImplementationStatus.UNCERTAIN,
+            }
+            status = status_map.get(vstr, ImplementationStatus.UNCERTAIN)
+            conf = a.get("confidence")
+            try:
+                conf_val = float(conf) if conf not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                conf_val = 0.0
+            gaps = a.get("gaps", []) if isinstance(a.get("gaps"), list) else []
+            assessments.append(RequirementAssessment(
+                requirement_id=str(a.get("req_ref", "")),
+                status=status, verdict=verdict,
+                confidence=conf_val,
+                evidence_refs=a.get("evidence_refs", []) if isinstance(a.get("evidence_refs"), list) else [],
+                gaps=gaps,
+                summary=str(a.get("risk", "") or vstr),
+            ))
+    except Exception:
+        assessments = []
+
+    return AnalysisReport(
+        report_id=base.report_id,
+        requirement_source=base.requirement_source,
+        projects=projects or base.projects,
+        branch=branch or base.branch,
+        requirements=base.requirements,
+        evidence=evidence,
+        impacts=impacts,
+        test_cases=cases,
+        assessments=assessments,
+        notes=base.notes + [f"收尾重建：{len(evidence)} 证据 / {len(impacts)} 链路 / "
+                            f"{len(cases)} 用例 / {len(assessments)} 裁决"],
+    )
+
+
+def _to_requirement_item(it: dict[str, Any]) -> RequirementItem:
+    """AI 需求条目 dict → RequirementItem（优先级/验收标准容错）。"""
+    try:
+        priority = Priority(str(it.get("priority", "P1")))
+    except ValueError:
+        priority = Priority.P1
+    ac = it.get("acceptance_criteria", [])
+    if not isinstance(ac, list):
+        ac = [str(ac)] if ac else []
+    return RequirementItem(
+        id=str(it.get("id", "REQ-001")),
+        title=str(it.get("title", "")),
+        description=str(it.get("description", "")),
+        priority=priority,
+        acceptance_criteria=[str(x) for x in ac if x],
+    )
 
 
 def _merge_assessments(items: list[dict], impl_result: list | None, verdicts: list | None) -> list[dict]:

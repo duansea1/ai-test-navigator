@@ -25,7 +25,8 @@ def render_markdown(report: AnalysisReport) -> str:
     lines = [f"# AI Test Navigator 报告：{report.report_id}", "", f"- 需求来源：`{report.requirement_source}`", f"- 分支：`{report.branch}`", f"- 项目：{', '.join(report.projects)}", "", "## 汇总", "", f"需求 {s['requirements']} · 证据 {s['evidence']} · 影响范围 {s['impacts']} · 测试用例 {s['test_cases']} · 待评审 {s['needs_review']}", "", "## 需求实现矩阵", "", "| ID | 需求 | 实现状态 | 结论 | 置信度 |", "|---|---|---|---|---|"]
     for req in report.requirements:
         a = next((x for x in report.assessments if x.requirement_id == req.id), None)
-        lines.append(f"| {req.id} | {req.title} | {a.status.value if a else '-'} | {a.verdict.value if a else '-'} | {a.confidence:.0%} |")
+        conf = f"{a.confidence:.0%}" if a else "-"
+        lines.append(f"| {req.id} | {req.title} | {a.status.value if a else '-'} | {a.verdict.value if a else '-'} | {conf} |")
     lines += ["", "## 影响范围", "", "| 需求 | 区域 | 风险 | 受影响项 |", "|---|---|---|---|"]
     for impact in report.impacts:
         lines.append(f"| {impact.requirement_id} | {impact.area} | {impact.risk_level.value} | {'; '.join(impact.affected_items[:3])} |")

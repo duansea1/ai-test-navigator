@@ -71,11 +71,15 @@ def _http_get_models(base_url: str, api_key: str) -> tuple[bool, Any]:
     return False, last_err
 
 
-def _http_chat_probe(base_url: str, api_key: str, model_id: str) -> tuple[bool, Any]:
+def _http_chat_probe(base_url: str, api_key: str, model_id: str,
+                     extra_body: dict[str, Any] | None = None) -> tuple[bool, Any]:
     """真实单模型连通探测：向目标模型发一条最小 chat completion，确认其可调用。
 
     与 _http_get_models（仅列目录）不同，本函数验证的是「这个具体模型能不能真正回答」，
     即连通 + 鉴权 + 模型存在且可推理 三者同时成立。
+    extra_body：附加请求字段——切换探测用它带上 DSH 同款参数（如 thinking），
+    保证「探测通过」等价于「DSH 实战可用」（2026-09-01 实测：部分网关
+    不认 DeepSeek 的 thinking 参数，裸探测过但 DSH 每次都失败）。
     """
     if not base_url:
         return False, {"error": "未配置 API 地址"}
@@ -91,12 +95,15 @@ def _http_chat_probe(base_url: str, api_key: str, model_id: str) -> tuple[bool, 
     last_err: Any = {"error": "未探测到可用端点"}
     for path in ("/v1/chat/completions", "/chat/completions"):
         url = root.rstrip("/") + path
-        body = json.dumps({
+        payload = {
             "model": model_id,
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 8,
             "stream": False,
-        }).encode("utf-8")
+        }
+        if extra_body:
+            payload.update(extra_body)
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -161,16 +168,66 @@ def runtime_config() -> dict[str, object]:
 
 @router.post("/agents/runtime/config")
 def runtime_set_config(payload: dict[str, str]) -> dict[str, object]:
-    """运行时切换供应商配置（立即生效于后续新回合，无需重启服务）。"""
+    """运行时切换供应商/模型（立即生效于后续新回合，无需重启服务）。
+
+    payload：{provider_key?, model?}——可只换供应商（模型用其目录内选中/首个）、
+    可只换模型（当前供应商下）、可同时换。选择持久化到 app_settings，重启不丢
+    （2026-09-01 修复「重启后选型回默认」）。
+
+    切换后立即真实探测一次模型连通（最小 chat completion，带 DSH 同款参数）——
+    切到不可用的模型（如不存在的模型名 HTTP 404）当场报出来。探测失败不阻断
+    切换（返回 probe 字段，前端 toast 警告）。"""
     provider_key = str(payload.get("provider_key") or "").strip()
-    if provider_key:
-        if E.get_model_config_full(provider_key) is None:
-            raise HTTPException(400, f"供应商配置不存在：{provider_key}")
-        return manager.reconfigure(provider_key=provider_key)
     model = str(payload.get("model") or "").strip()
-    if model:
-        return manager.reconfigure(provider_key=model)
-    return manager.availability()
+    if provider_key and E.get_model_config_full(provider_key) is None:
+        raise HTTPException(400, f"供应商配置不存在：{provider_key}")
+    if model and provider_key:
+        row = E.get_model_config_full(provider_key) or {}
+        if model not in (row.get("model_ids") or []):
+            raise HTTPException(400, f"模型 {model} 不在 {provider_key} 的模型目录中")
+    if not provider_key and not model:
+        return manager.availability()
+    out = manager.reconfigure(provider_key=provider_key or None, model=model or None)
+    # 探测真实生效的目标（切换后的供应商 × 模型），而非表单目录里的第一个
+    probe_target = provider_key or (out.get("provider_key") if isinstance(out, dict) else None)
+    if probe_target:
+        return {**out, "probe": _probe_provider(probe_target, model or None)}
+    return out
+
+
+def _probe_provider(provider_key: str, model: str | None = None) -> dict[str, object]:
+    """对供应商配置发一条最小 chat completion，验证真实可调。
+
+    model：指定要探测的模型 ID（缺省探测该供应商目录首个——与 runtime
+    实际解析保持一致）。保真两件事（2026-09-01）：① base_url 与 runtime 同款
+    归一化（纯域名补 /v1），URL 与 DSH 实际请求的 `{baseURL}/chat/completions`
+    一致；② 请求体带 DSH 同款 thinking 参数（cordis llm-deepseek thinking:
+    enabled）——部分网关不认该参数，裸探测会误报可用。探测与实战同路径同
+    参数，测得过才真的能用。"""
+    ok, base_url, api_key, model_ids = _resolve_test_target(provider_key, {})
+    if not ok:
+        return {"ok": False, "error": f"供应商配置不存在：{provider_key}"}
+    if not model_ids:
+        return {"ok": False, "error": "未配置模型 ID"}
+    target = model if model in model_ids else model_ids[0]
+    base_url = manager._normalize_base_url(base_url)
+    # 与 DSH 实战请求同款字段（cordis llm-deepseek: thinking enabled + reasoningEffort max）
+    extra = {"thinking": {"type": "enabled"}, "reasoning_effort": "max"}
+    # 保真第三件事（2026-09-02）：网关供应商还要带 runtime 钳制后的 max_tokens
+    # （DSH 默认 256000 会被宝云网关 400——探测不带就测不出这个问题）
+    mt = manager._max_tokens_for(base_url)
+    if mt:
+        extra["max_tokens"] = mt
+    pok, pdata = _http_chat_probe(base_url, api_key, target, extra_body=extra)
+    if pok:
+        return {"ok": True, "error": None, "model": target}
+    err = pdata.get("error") if isinstance(pdata, dict) else pdata
+    if not isinstance(err, str):
+        try:
+            err = json.dumps(err, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            err = str(err)
+    return {"ok": False, "error": str(err)[:300], "model": target}
 
 
 @router.get("/agents/runtime/config/models")

@@ -205,6 +205,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话消息表'
 """
 
+_APP_SETTINGS = """
+CREATE TABLE IF NOT EXISTS app_settings (
+  k VARCHAR(64) PRIMARY KEY COMMENT '设置键',
+  v TEXT COMMENT '设置值（字符串）',
+  updated_at DATETIME NOT NULL COMMENT '更新时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='平台轻量设置（键值对，如当前选中模型）'
+"""
+
 
 def _sqlite(ddl: str) -> list[str]:
     """MySQL DDL → SQLite：去引擎/表注释子句、AUTO_INCREMENT→AUTOINCREMENT、索引单独建。"""
@@ -245,7 +253,7 @@ def _build_sqlite_schema() -> list[str]:
     stmts: list[str] = []
     for ddl in (_TASKS, _REQUIREMENTS, _CODE_EVIDENCE, _IMPACT, _TEST_CASES,
                 _TEST_RUNS, _ASSESSMENTS, _REPORTS, _AGENT_SESSIONS, _DSH_EVENTS,
-                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES):
+                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES, _APP_SETTINGS):
         stmts.extend(_sqlite(ddl))
     # SQLite 索引
     for tbl, col in [("analysis_tasks", "status"), ("analysis_tasks", "created_at"),
@@ -262,7 +270,7 @@ def _build_sqlite_schema() -> list[str]:
 
 SCHEMA_MYSQL = [_TASKS, _REQUIREMENTS, _CODE_EVIDENCE, _IMPACT, _TEST_CASES,
                 _TEST_RUNS, _ASSESSMENTS, _REPORTS, _AGENT_SESSIONS, _DSH_EVENTS,
-                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES]
+                _MODEL_CONFIGS, _CONVERSATIONS, _CHAT_MESSAGES, _APP_SETTINGS]
 SCHEMA_SQLITE = _build_sqlite_schema()
 
 
@@ -588,6 +596,17 @@ def list_messages(conv_id: str, limit: int = 100) -> list[dict[str, Any]]:
     return rows
 
 
+def find_conversation_of_task(task_id: str) -> str | None:
+    """反查任务挂在哪个会话（chat_messages.task_id 关联，取最新一条）。
+
+    任务结论回写会话用——analysis_tasks 表本身不存 conversation_id，
+    关联关系经「已创建分析任务」消息的 task_id 字段表达。"""
+    return engine.scalar(
+        "SELECT conv_id FROM chat_messages WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+
+
 # ─── repository：会话删除（M3.2c，2026-08-27）─────────────────────────────────
 
 # 任务关联的从表（删任务时一并清，避免孤儿数据）。与 analysis_tasks 无外键约束，
@@ -735,6 +754,27 @@ def get_default_model_config() -> dict[str, Any] | None:
         return None
     r["model_ids"] = engine.loads(r.get("model_ids"), [])
     return r
+
+
+# ─── repository：app_settings（平台轻量设置键值对） ─────────────────────────
+
+def get_setting(k: str, default: str | None = None) -> str | None:
+    """读一个平台设置（无值/DB 不可用时返回 default）。"""
+    try:
+        v = engine.scalar("SELECT v FROM app_settings WHERE k = ?", (k,))
+        return v if v not in (None, "") else default
+    except Exception:
+        return default
+
+
+def set_setting(k: str, v: str) -> None:
+    """写一个平台设置（UPDATE-then-INSERT 双方言 upsert，可重复执行）。"""
+    now = _now()
+    affected = engine.execute("UPDATE app_settings SET v = ?, updated_at = ? WHERE k = ?",
+                              (v, now, k))
+    if not affected:
+        engine.insert("INSERT INTO app_settings (k, v, updated_at) VALUES (?, ?, ?)",
+                      (k, v, now))
 
 
 def restore_default_model_configs() -> None:
