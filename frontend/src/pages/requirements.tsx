@@ -1,7 +1,18 @@
 import React from 'react'
 import { getJson, postForm, streamSse, postFormSse, delJson, patchForm } from '../api'
 import { ModelModal } from '../components/ModelDrawer'
-import { toast as showToast } from '../components/ui'
+import { toast as showToast, Icon } from '../components/ui'
+import { createPortal } from 'react-dom'
+
+/** 计算小气泡（更多菜单 / 删除确认）的固定定位：默认在触发点下方，空间不足则翻到上方。 */
+function popStyle(rect: DOMRect, h: number, w: number): React.CSSProperties {
+  let top = rect.bottom + 4
+  if (top + h > window.innerHeight - 8) top = rect.top - h - 4
+  let left = rect.right - w
+  if (left < 8) left = 8
+  if (left + w > window.innerWidth - 8) left = window.innerWidth - w - 8
+  return { position: 'fixed', top: Math.max(8, top), left, width: w, zIndex: 600 }
+}
 
 /* ── 类型 ──────────────────────────────────────────────────────────── */
 interface TaskItem {
@@ -110,10 +121,10 @@ function groupConvs(convs: ConvItem[]): Array<[string, ConvItem[]]> {
 
 
 /* ── 项目选择 chip + 弹层（多选 + 高级选项收进弹层底部） ────────────── */
-function ProjectPicker({ options, value, onChange, workspace, branch,
+function ProjectPicker({ options, value, onChange, workspace, branch, wsValid,
   onWorkspace, onBranch }: {
   options: ProjectOption[]; value: string[]; onChange: (v: string[]) => void
-  workspace: string; branch: string
+  workspace: string; branch: string; wsValid: boolean
   onWorkspace: (v: string) => void; onBranch: (v: string) => void
 }) {
   const [open, setOpen] = React.useState(false)
@@ -154,6 +165,7 @@ function ProjectPicker({ options, value, onChange, workspace, branch,
           </div>
           <div className="pop-foot">
             <button className="link" onClick={() => onChange([])}>清空</button>
+            <button className="link" onClick={() => onChange(options.map(o => o.name))}>全选本目录</button>
             <span className="hint">已选 {value.length} / {options.length}</span>
           </div>
           <div className="pop-adv">
@@ -162,7 +174,11 @@ function ProjectPicker({ options, value, onChange, workspace, branch,
             </button>
             {advOpen && (
               <div className="pop-adv-form">
-                <div><label>源码工作区</label><input value={workspace} onChange={e => onWorkspace(e.target.value)} /></div>
+                <div>
+                  <label>源码工作区</label>
+                  <input value={workspace} onChange={e => onWorkspace(e.target.value)} />
+                  {wsValid === false && <div className="hint err">目录不存在，已回退默认工作区</div>}
+                </div>
                 <div><label>分支</label><input value={branch} onChange={e => onBranch(e.target.value)} /></div>
               </div>
             )}
@@ -515,8 +531,12 @@ export function RequirementsPage() {
   // composer
   const [text, setText] = React.useState('')
   const [selProjects, setSelProjects] = React.useState<string[]>([])
-  const [workspace, setWorkspace] = React.useState('')
-  const [branch, setBranch] = React.useState('')
+  // 源码工作区 / 分支：存 localStorage，前端随时改、刷新不丢，免改后端配置/重启
+  const [workspace, setWorkspace] = React.useState(() => localStorage.getItem('nav.workspace') || '')
+  const [branch, setBranch] = React.useState(() => localStorage.getItem('nav.branch') || '')
+  const [wsMatched, setWsMatched] = React.useState(true)  // 前端所选目录是否被后端命中（false=回退默认）
+  const handleWorkspace = (v: string) => { setWorkspace(v); try { localStorage.setItem('nav.workspace', v) } catch {} }
+  const handleBranch = (v: string) => { setBranch(v); try { localStorage.setItem('nav.branch', v) } catch {} }
   const [files, setFiles] = React.useState<File[]>([])  // 粘贴/拖拽的附件
   const [dragOver, setDragOver] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
@@ -524,7 +544,19 @@ export function RequirementsPage() {
   const [mode, setMode] = React.useState<string>('auto')
   const [detected, setDetected] = React.useState('')
   const [intentReason, setIntentReason] = React.useState('')
-  const [editingId, setEditingId] = React.useState('')  // 正在重命名的会话 id（双击进入）
+  const [menu, setMenu] = React.useState<{ id: string; rect: DOMRect } | null>(null)
+  const [renamingId, setRenamingId] = React.useState('')
+  const [renameVal, setRenameVal] = React.useState('')
+  const [delConfirm, setDelConfirm] = React.useState<{ id: string; rect: DOMRect } | null>(null)
+  const skipCommitRef = React.useRef(false)
+  // 侧栏内操作（重命名/删除）的就近反馈：浮在侧栏顶部，而非右下角全局 toast
+  const [sideHint, setSideHint] = React.useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const sideHintTimer = React.useRef<number | null>(null)
+  function flashSide(kind: 'ok' | 'err', text: string) {
+    setSideHint({ kind, text })
+    if (sideHintTimer.current) window.clearTimeout(sideHintTimer.current)
+    sideHintTimer.current = window.setTimeout(() => setSideHint(null), 2600)
+  }
 
   const msgsRef = React.useRef<HTMLDivElement>(null)
   const inputRef = React.useRef<HTMLTextAreaElement>(null)
@@ -536,13 +568,22 @@ export function RequirementsPage() {
 
   const showToastMsg = (msg: string) => showToast(msg, 'info')
 
+  // 项目清单：随「源码工作区」变化重新拉取（支持前端切换目录，免改后端配置/重启）
   React.useEffect(() => {
-    getJson<{ workspace: string; default_branch: string; projects: ProjectOption[] }>('/api/projects')
-      .then(d => {
-        setProjectOpts(d.projects ?? [])
-        setWorkspace(w => w || d.workspace)
-        setBranch(b => b || d.default_branch)
-      }).catch(() => {})
+    const ws = workspace.trim()
+    const t = window.setTimeout(() => {
+      getJson<{ workspace: string; default_branch: string; projects: ProjectOption[] }>(
+        `/api/projects${ws ? `?workspace=${encodeURIComponent(ws)}` : ''}`)
+        .then(d => {
+          setProjectOpts(d.projects ?? [])
+          setWsMatched(d.workspace_matched ?? true)
+          setWorkspace(w => w || d.workspace)   // 仅用户未手动填过时，用后端默认兜底
+          setBranch(b => b || d.default_branch)
+        }).catch(() => {})
+    }, 300)
+    return () => window.clearTimeout(t)
+  }, [workspace])
+  React.useEffect(() => {
     getJson<RuntimeStatus>('/api/agents/runtime/status').then(setDsh).catch(() => {})
     getJson<{ models: ModelOption[] }>('/api/agents/runtime/config')
       .then(d => setModels(d.models ?? [])).catch(() => {})
@@ -665,14 +706,12 @@ export function RequirementsPage() {
   }
 
   /** 删除会话：连带删 chat_messages + 会话内全部任务及其衍生数据。
-  删当前会话 → 切回新会话视图；删别的 → 只刷新列表。二次确认防误删。 */
-  async function deleteConversation(id: string, title: string) {
-    const label = title || id
-    if (!window.confirm(`确定删除会话「${label}」？\n该会话内的所有任务和消息将一并删除，且不可恢复。`)) return
+  删当前会话 → 切回新会话视图；删别的 → 只刷新列表。二次确认由自定义弹框负责。 */
+  async function deleteConversation(id: string, label: string) {
     try {
       const r = await delJson<{ deleted: boolean; deleted_tasks: string[] }>(`/api/conversations/${id}`)
       const n = r?.deleted_tasks?.length ?? 0
-      showToast(`已删除会话「${label}」${n ? `（含 ${n} 个任务）` : ''}`, 'ok')
+      flashSide('ok', `已删除会话「${label}」${n ? `（含 ${n} 个任务）` : ''}`)
       // 删的是当前会话：切回新会话视图
       if (id === convId) {
         newSession()
@@ -691,7 +730,6 @@ export function RequirementsPage() {
     const t = (newTitle || '').trim()
     const cur = convs.find(c => c.conv_id === id)
     const oldTitle = cur?.title || ''
-    setEditingId('')
     if (!t || t === oldTitle) return  // 空或未改：静默退出
     // 乐观更新
     setConvs(prev => prev.map(c => c.conv_id === id ? { ...c, title: t } : c))
@@ -699,12 +737,25 @@ export function RequirementsPage() {
       const fd = new FormData()
       fd.append('title', t)
       await patchForm<{ conversation_id: string; title: string }>(`/api/conversations/${id}`, fd)
-      showToast(`已重命名为「${t}」`, 'ok')
+      flashSide('ok', `已重命名为「${t}」`)
     } catch (e) {
       // 回滚
       setConvs(prev => prev.map(c => c.conv_id === id ? { ...c, title: oldTitle } : c))
-      showToast(`重命名失败：${e}`, 'err')
+      flashSide('err', `重命名失败：${e}`)
     }
+  }
+
+  // 行内重命名：双击会话名或「更多 → 重命名」进入，Enter/失焦提交、Esc 取消
+  function startRename(id: string, title: string) {
+    setRenamingId(id)
+    setRenameVal(title || '')
+  }
+  function commitRename(id: string) {
+    const v = renameVal
+    skipCommitRef.current = true  // 避免失焦时二次提交
+    setRenamingId('')
+    setRenameVal('')
+    saveRename(id, v)
   }
 
   /** 切换模型（运行时热切换）。 */
@@ -757,6 +808,8 @@ export function RequirementsPage() {
       if (convId) cf.append('conversation_id', convId)
       if (mode !== 'auto') cf.append('mode', mode)
       if (selProjects.length) cf.append('projects', selProjects.join(' '))
+      // 工作区必须带上：问答链路要用它拼绝对路径去实查源码，否则模型只能凭记忆空答
+      if (workspace.trim()) cf.append('workspace', workspace.trim())
       files.forEach(f => cf.append('attachments', f))
       // 本地即时追加 user 消息（后端已落库；文本附件内容后端会并入）
       const askText = text.trim()
@@ -891,6 +944,12 @@ export function RequirementsPage() {
       {/* ── 左侧：会话列表（z.ai 式：新建按钮 + 按时间分组） ─────────── */}
       {/* 任务不单列：任务挂在会话消息流里（📦 块可点击），最近任务 Ctrl+K 直达 */}
       <div className="chat-side">
+        {sideHint && (
+          <div className={`side-hint ${sideHint.kind}`}>
+            <span className="ic">{sideHint.kind === 'ok' ? <Icon name="check" size={12} /> : <Icon name="alert" size={12} />}</span>
+            <span>{sideHint.text}</span>
+          </div>
+        )}
         <button className="new-chat-btn" onClick={newSession}>＋ 新建会话</button>
         <div className="side-list">
           {convs.length === 0 ? <div className="empty" style={{ padding: 18 }}>暂无会话，输入内容开始对话</div> :
@@ -899,22 +958,28 @@ export function RequirementsPage() {
                 <div className="conv-glabel">{g}</div>
                 {items.map(c => (
                   <div key={c.conv_id} className={`conv-item ${c.conv_id === convId ? 'active' : ''}`}
-                    onClick={() => editingId !== c.conv_id && openConversation(c.conv_id)}>
-                    {editingId === c.conv_id ? (
-                      <input className="c-edit" defaultValue={c.title || c.conv_id} autoFocus
+                    onClick={() => { if (renamingId !== c.conv_id) openConversation(c.conv_id) }}>
+                    {renamingId === c.conv_id ? (
+                      <input className="c-edit" value={renameVal}
+                        autoFocus
                         onClick={e => e.stopPropagation()}
+                        onChange={e => setRenameVal(e.target.value)}
                         onKeyDown={e => {
-                          if (e.key === 'Enter') { e.preventDefault(); saveRename(c.conv_id, (e.target as HTMLInputElement).value) }
-                          else if (e.key === 'Escape') { e.preventDefault(); setEditingId('') }
+                          if (e.key === 'Enter') { e.preventDefault(); commitRename(c.conv_id) }
+                          else if (e.key === 'Escape') { e.preventDefault(); skipCommitRef.current = true; setRenamingId(''); setRenameVal('') }
                         }}
-                        onBlur={e => saveRename(c.conv_id, e.target.value)} />
+                        onBlur={() => { if (skipCommitRef.current) { skipCommitRef.current = false; return } commitRename(c.conv_id) }} />
                     ) : (
                       <span className="c-title"
-                        onDoubleClick={e => { e.stopPropagation(); setEditingId(c.conv_id) }}
+                        onDoubleClick={e => { e.stopPropagation(); startRename(c.conv_id, c.title) }}
                         title="双击重命名">{c.title || c.conv_id}</span>
                     )}
-                    <span className="t-del" title="删除会话"
-                      onClick={e => { e.stopPropagation(); deleteConversation(c.conv_id, c.title) }}>×</span>
+                    <span className="t-more" title="更多"
+                      onClick={e => {
+                        e.stopPropagation()
+                        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                        setMenu(menu && menu.id === c.conv_id ? null : { id: c.conv_id, rect: r })
+                      }}>⋯</span>
                   </div>
                 ))}
               </div>
@@ -1098,8 +1163,8 @@ export function RequirementsPage() {
                 <input ref={fileRef} type="file" multiple hidden
                   onChange={e => { addFiles(e.target.files ?? []); e.target.value = '' }} />
                 <ProjectPicker options={projectOpts} value={selProjects} onChange={setSelProjects}
-                  workspace={workspace} branch={branch}
-                  onWorkspace={setWorkspace} onBranch={setBranch} />
+                  workspace={workspace} branch={branch} wsValid={wsMatched}
+                  onWorkspace={handleWorkspace} onBranch={handleBranch} />
                 <ModePicker value={mode} onChange={setMode} />
                 <ModelBar currentModel={dsh?.model} onOpen={() => setDrawerOpen(true)} ok={dsh?.ready} />
               </div>
@@ -1117,6 +1182,28 @@ export function RequirementsPage() {
           </div>
           <ModelModal open={drawerOpen} currentKey={dsh?.provider_key} currentModel={dsh?.model}
             onClose={() => setDrawerOpen(false)} onChanged={refreshRuntime} />
+          {menu && createPortal(
+            <div className="pop-mask" onClick={() => setMenu(null)}>
+              <div className="conv-menu" style={popStyle(menu.rect, 76, 130)} onClick={e => e.stopPropagation()}>
+                <div className="conv-menu-item" onClick={() => { const id = menu.id; setMenu(null); startRename(id, convs.find(c => c.conv_id === id)?.title || '') }}>✎ 重命名</div>
+                <div className="conv-menu-item danger" onClick={() => { const r = menu.rect, id = menu.id; setMenu(null); setDelConfirm({ id, rect: r }) }}>🗑 删除</div>
+              </div>
+            </div>,
+            document.body
+          )}
+          {delConfirm && createPortal(
+            <div className="pop-mask" onClick={() => setDelConfirm(null)}>
+              <div className="conv-del-pop" style={popStyle(delConfirm.rect, 92, 184)} onClick={e => e.stopPropagation()}>
+                <div className="cdp-text">删除该会话？</div>
+                <div className="cdp-sub">会话内的任务与消息将一并删除，且不可恢复</div>
+                <div className="cdp-actions">
+                  <button className="btn sm" onClick={() => setDelConfirm(null)}>取消</button>
+                  <button className="btn sm danger" onClick={() => { const id = delConfirm.id, t = convs.find(c => c.conv_id === id)?.title || id; setDelConfirm(null); deleteConversation(id, t) }}>删除</button>
+                </div>
+              </div>
+            </div>,
+            document.body
+          )}
         </div>
       </div>
     </div>

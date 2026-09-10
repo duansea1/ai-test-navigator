@@ -272,7 +272,7 @@ export function ModelModal({ open, currentKey, currentModel, onClose, onChanged 
                     </div>
                     <div className="mc-summary-meta">
                       <span className="mc-summary-model">{view.provider_key === currentKey ? `当前模型：${currentModel || '未选择'}` : '未启用'}</span>
-                      {view.base_url && <span className="mc-detail-url" title={view.provider_key}>{view.base_url}</span>}
+                      {view.base_url && <span className="mc-detail-url" title={view.base_url}>{view.base_url}</span>}
                     </div>
                   </div>
                   <div className="mc-ops">
