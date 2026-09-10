@@ -27,6 +27,8 @@ reports/
 *.err
 scripts/.dsh-closure.json
 scripts/last_task.json
+# 任务数据转储（含需求原文），非项目产物
+scripts/check.json
 
 # ── 系统文件 ───────────────────────────────────────────────
 .DS_Store
