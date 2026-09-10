@@ -481,7 +481,11 @@ def _run_task(task_id: str, mode: str = "full") -> None:
             evidence, _, vrep = _run_agent(
                 task_id, "code-locator",
                 f"你可以使用 glob/grep/read 工具在源码工作区实际检索。\n"
-                f"工作区：{workspace}（项目：{', '.join(projects) if projects else '自行探索'}）\n\n"
+                f"工作区：{workspace}（项目：{', '.join(projects) if projects else '自行探索'}）\n"
+                # 工具 cwd 是平台默认根目录（非本工作区），相对路径会解析到错误位置，
+                # 故强制要求绝对路径，保证真正读到该文件。
+                f"重要：所有工具调用的 path 必须是绝对路径，且以该工作区开头"
+                f"（例如 {workspace}\\<项目目录>\\src\\...）；禁止使用相对路径。\n\n"
                 f"需求条目：\n{req_digest}\n\n"
                 "请实际检索源码，输出 JSON：evidence[{{project,path,line,symbol,snippet,"
                 "requirement_id(REQ-xxx),confidence(0-1)}}]。每条证据标注支撑哪条需求。",

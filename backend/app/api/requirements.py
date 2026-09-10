@@ -118,6 +118,7 @@ async def classify(text: str = Form(""), conversation_id: str = Form("")) -> dic
 @router.post("/chat")
 async def chat(text: str = Form(""), conversation_id: str = Form(""),
                mode: str = Form(""), projects: str = Form(""),
+               workspace: str = Form(""),
                attachments: list[UploadFile] = File(default=[])) -> dict[str, object]:
     """对话回合（多轮）：classify（qa 时直接回答）+ 消息落库。
     analyze/full 由前端转 /requirements/tasks 建任务，这里只处理问答回合。
@@ -153,7 +154,7 @@ async def chat(text: str = Form(""), conversation_id: str = Form(""),
         else:
             intent = do_classify(t, cid, projects=proj_list)
         if intent["intent"] == "qa" or mode == "qa":
-            qa = qa_answer_result(t, cid, projects=proj_list)
+            qa = qa_answer_result(t, cid, projects=proj_list, workspace=workspace or None)
             E.save_message(cid, "assistant", qa["answer"], intent=intent["intent"])
             E.touch_conversation(cid)
             return {"conversation_id": cid, "intent": "qa", "reason": intent.get("reason", ""),
@@ -171,6 +172,7 @@ async def chat(text: str = Form(""), conversation_id: str = Form(""),
 @router.post("/chat/stream")
 async def chat_stream(text: str = Form(""), conversation_id: str = Form(""),
                       mode: str = Form(""), projects: str = Form(""),
+                      workspace: str = Form(""),
                       attachments: list[UploadFile] = File(default=[])):
     """/chat 的 SSE 版：问答回答逐段流式推送（打字机），意图与最终答案随行。
 
@@ -224,7 +226,8 @@ async def chat_stream(text: str = Form(""), conversation_id: str = Form(""),
                 else:
                     intent = do_classify(t, cid, projects=proj_list)
                 if intent["intent"] == "qa" or mode == "qa":
-                    qa = qa_answer_result(t, cid, projects=proj_list, on_delta=_q_delta)
+                    qa = qa_answer_result(t, cid, projects=proj_list,
+                                          workspace=workspace or None, on_delta=_q_delta)
                     E.save_message(cid, "assistant", qa["answer"], intent=intent["intent"])
                     E.touch_conversation(cid)
                     return {"conversation_id": cid, "intent": "qa",

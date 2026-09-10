@@ -168,6 +168,22 @@ def _project_block(projects: list[str] | None) -> str:
     return f"用户选定的目标项目：{names}（用户的提问/分析基于这些项目）\n\n"
 
 
+def _workspace_block(workspace: str | None) -> str:
+    """用户选定的源码工作区（绝对路径）注入提示词。
+
+    问答链路同样必须带工作区：否则模型根本不知道源码在哪，只能凭记忆空答
+    （2026-09-04 实测「问 AI 它不去查文件」的根因——/api/chat 与 qa_answer_result
+    此前都不接收 workspace，prompt 里只有项目名、没有可检索的路径）。
+    """
+    w = (workspace or "").strip()
+    if not w:
+        return ""
+    return (f"源码工作区：{w}\n"
+            "涉及具体代码/接口/实现的问题，必须用 glob/grep/read 工具在该工作区内实际检索后"
+            f"再回答；工具调用的 path 一律用绝对路径且以该工作区开头（例如 {w}\\<项目目录>\\src\\...），"
+            "禁止相对路径。检索不到就明说未找到，不要凭记忆编造。\n\n")
+
+
 def classify(text: str, conversation_id: str | None = None,
              projects: list[str] | None = None) -> dict:
     """意图识别：一律先调 DSH intent-classifier（规则在 prompt/skill 里，模型说了算）；
@@ -217,6 +233,7 @@ def _failure_note(res: dict, prompt: str) -> str:
 
 def qa_answer_result(text: str, conversation_id: str | None = None,
                      projects: list[str] | None = None,
+                     workspace: str | None = None,
                      on_delta: Callable[[str], None] | None = None) -> dict:
     """qa_answer 的结构化版本：{answer, model_error}。
 
@@ -227,8 +244,9 @@ def qa_answer_result(text: str, conversation_id: str | None = None,
     t = (text or "").strip()
     prompt = _agent_prompt("qa-assistant")
     history = _history_block(conversation_id)
+    ws_block = _workspace_block(workspace)
     proj_block = _project_block(projects)
-    res = _stream_turn(f"{prompt}\n\n{history}{proj_block}用户：{t}",
+    res = _stream_turn(f"{prompt}\n\n{history}{ws_block}{proj_block}用户：{t}",
                        _router_session(conversation_id, "qa"),
                        on_delta=on_delta) if prompt else {"status": "error"}
     if res.get("status") == "ok":
@@ -245,6 +263,7 @@ def qa_answer_result(text: str, conversation_id: str | None = None,
 
 def qa_answer(text: str, conversation_id: str | None = None,
               projects: list[str] | None = None,
+              workspace: str | None = None,
               on_delta: Callable[[str], None] | None = None) -> str:
     """问答式回答：一律先调 DSH qa-assistant（问候也不例外）；
     不可用时明说「未调用 AI」并给能力引导；模型报错时说真因。
@@ -255,4 +274,4 @@ def qa_answer(text: str, conversation_id: str | None = None,
     用户问「这个项目的登录怎么测」，不带项目就是无源之水；
     选了项目时注入项目名，让模型把回答落到具体项目上。
     on_delta：流式回调——DSH 每段 assistant 消息实时推给前端打字机显示。"""
-    return qa_answer_result(text, conversation_id, projects, on_delta)["answer"]
+    return qa_answer_result(text, conversation_id, projects, workspace, on_delta)["answer"]
