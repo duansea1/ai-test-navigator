@@ -124,6 +124,28 @@ class DshRuntimeManager:
             return self._GATEWAY_MAX_TOKENS
         return None
 
+    def _apply_thinking_config(self, base_url: str | None) -> None:
+        """按供应商注入 llm-deepseek 的 thinking/推理强度（cordis.yml 经 !!js 读环境变量）。
+
+        实测（2026-09-04）：第三方网关（ai-api.baoyun.com）不认 DeepSeek 的 thinking 参数，
+        带之即 400 "Unknown parameter: 'thinking'" —— 全部 Agent 因此失败，任务降级为规则
+        分析（表现为「回答不是 AI 写的」「0 条证据」）。官方 DeepSeek API 支持该参数。
+
+        源码确证（dsh-llm-deepseek serialize.ts resolveThinking）：只有 thinking 与
+        reasoningEffort 均为 undefined 时请求体才真正省略该字段；'disabled' 仍会发送
+        thinking:{type:'disabled'}，不认该字段的网关照样 400。故网关场景直接 pop 掉环境
+        变量，令 cordis 中 process.env.DSH_THINKING 为 undefined。
+        """
+        import os
+
+        host = (base_url or "").lower()
+        if any(h in host for h in self._GATEWAY_HOSTS):
+            os.environ.pop("DSH_THINKING", None)
+            os.environ.pop("DSH_REASONING_EFFORT", None)
+            return
+        os.environ["DSH_THINKING"] = self.settings.dsh_thinking
+        os.environ["DSH_REASONING_EFFORT"] = self.settings.dsh_reasoning_effort
+
     @staticmethod
     def _normalize_base_url(base: str | None) -> str | None:
         """base_url 归一化（2026-09-01 实测踩坑）。
@@ -216,6 +238,8 @@ class DshRuntimeManager:
                 os.environ["DSH_RUNTIME_MODE"] = self.settings.dsh_mode
                 # Skills 目录注入：cordis.yml 的 skill-filesystem customSkillDirs
                 os.environ["DSH_CUSTOM_SKILL_DIRS"] = self.settings.dsh_skill_dirs
+                # thinking 参数按供应商注入：网关不认该参数，必须省略（详见方法注释）
+                self._apply_thinking_config(cfg["base_url"])
                 self.settings.dsh_session_root.mkdir(parents=True, exist_ok=True)
                 self._harness = dh.DeepSeekHarness(
                     provider=cfg["provider"],

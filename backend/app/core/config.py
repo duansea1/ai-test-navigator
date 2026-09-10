@@ -71,6 +71,10 @@ class Settings:
         # 平台 Skills 目录（DSH customSkillDirs，分号分隔）
         self.dsh_skill_dirs = os.getenv("DSH_SKILL_DIRS", str(PROJECT_ROOT / "skills"))
         self.dsh_provider = os.getenv("DSH_PROVIDER", "deepseek-official")
+        # llm-deepseek thinking 策略：仅官方 DeepSeek API 生效；第三方网关由
+        # runtime._apply_thinking_config 自动省略该参数（网关不认 → 400）。
+        self.dsh_thinking = os.getenv("DSH_THINKING", "enabled")
+        self.dsh_reasoning_effort = os.getenv("DSH_REASONING_EFFORT", "max")
         self.dsh_model = os.getenv("DSH_MODEL", "deepseek-v4-flash")
         self.dsh_session_root = PROJECT_ROOT / ".dsh-sessions"
 

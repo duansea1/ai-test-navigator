@@ -26,8 +26,17 @@
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek'
   config:
-    thinking: enabled
-    reasoningEffort: max
+    # thinking / reasoningEffort 改为按供应商注入（见 runtime.py _apply_thinking_config）。
+    # 背景（2026-09-04 实测）：第三方网关（如 ai-api.baoyun.com）不认 DeepSeek 的 thinking
+    # 参数，带之即 400 "Unknown parameter: 'thinking'"，导致全部 Agent 失败、任务降级为
+    # 规则分析（回答非 AI 产出、证据为 0）。官方 DeepSeek API 支持该参数。
+    #
+    # 关键约束（源码确证 dsh-llm-deepseek serialize.ts resolveThinking）：
+    #   只有 thinking 与 reasoningEffort 均为 undefined 时，请求体才真正省略该字段；
+    #   'disabled' 仍会发送 thinking:{type:'disabled'}，不认该字段的网关照样 400。
+    # 故网关场景直接在 runtime 里 pop 掉环境变量 → process.env.X 为 undefined → 不发送。
+    thinking: !!js process.env.DSH_THINKING
+    reasoningEffort: !!js process.env.DSH_REASONING_EFFORT
 
 # ── 本地执行与文件系统 ──────────────────────────────────────────────────────
 
